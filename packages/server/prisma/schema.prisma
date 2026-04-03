@@ -1,0 +1,528 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgvector(map: "vector")]
+}
+
+// ── Project ───────────────────────────────────────────────────────────────────
+
+model Project {
+  id          String   @id @default(uuid())
+  orgId       String   @default("default")
+  name        String
+  slug        String   @unique
+  description String?
+  settings    Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  sources          Source[]
+  documents        Document[]
+  chunks           Chunk[]
+  memories         Memory[]
+  entityRelations  EntityRelation[]
+  entities         Entity[]
+  ingestionJobs    IngestionJob[]
+  sessions         Session[]
+  sharedContexts   SharedContext[]
+
+  @@index([slug])
+  @@map("projects")
+}
+
+// ── Sources & Documents ───────────────────────────────────────────────────────
+
+enum SourceStatus {
+  PENDING
+  SYNCING
+  SYNCED
+  READY
+  INDEXING
+  ERROR
+  DISABLED
+}
+
+model Source {
+  id              String       @id @default(uuid())
+  orgId           String       @default("default")
+  projectId       String
+  name            String
+  type            String       // "github" | "web" | "pdf" | "text" | "notion" | ...
+  connectorType   String?      // alias / legacy field
+  config          Json         @default("{}")
+  status          SourceStatus @default(PENDING)
+  activeVersionId String?
+  lastSyncAt      DateTime?
+  lastSyncAt2     DateTime?    @map("last_sync_at2")
+  lastSyncError   String?
+  syncError       String?
+  syncSchedule    String?
+  syncMode        String?
+  lastSyncStatus  String?
+  deletedAt         DateTime?
+  documentCount     Int        @default(0)
+  chunkCount        Int        @default(0)
+  lastSyncDurationMs Int?
+  syncErrorCount     Int      @default(0)
+  restoreUntil       DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  documents Document[]
+  versions  SourceVersion[]
+
+  @@unique([projectId, name])
+  @@index([projectId])
+  @@index([status])
+  @@map("sources")
+}
+
+model SourceVersion {
+  id            String   @id @default(uuid())
+  sourceId      String
+  orgId         String?
+  projectId     String?
+  versionNumber Int
+  status        String   @default("STAGED") // STAGED | ACTIVE | SUPERSEDED
+  documentCount Int      @default(0)
+  chunkCount    Int      @default(0)
+  partialFailure Boolean  @default(false)
+  warningCodes  String[] @default([])
+  errorCode     String?
+  errorMessage  String?
+  syncJobId     String?
+  promotedAt    DateTime?
+  supersededAt  DateTime?
+  failedAt      DateTime?
+  restoreUntil  DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  source    Source     @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  documents Document[]
+
+  @@unique([sourceId, versionNumber])
+  @@index([sourceId, status])
+  @@map("source_versions")
+}
+
+enum DocumentStatus {
+  PENDING
+  PROCESSING
+  INDEXED
+  READY
+  ERROR
+}
+
+model Document {
+  id              String         @id @default(uuid())
+  sourceId        String
+  sourceVersionId String?
+  projectId       String?
+  externalId      String?
+  title           String
+  path            String?
+  mimeType        String?
+  contentHash     String?
+  content         String?
+  language        String?
+  tokens          Int            @default(0)
+  status          DocumentStatus @default(PENDING)
+  parseError      String?
+  webUrl          String?
+  metadata        Json           @default("{}")
+  indexedAt       DateTime?
+  lastModified    DateTime?
+  deletedAt         DateTime?
+  chunkingStrategy  String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  chunks        Chunk[]
+  entities      Entity[]
+  project       Project?       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  source        Source         @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  sourceVersion SourceVersion? @relation(fields: [sourceVersionId], references: [id], onDelete: SetNull)
+
+  @@index([sourceId])
+  @@index([sourceVersionId])
+  @@index([contentHash])
+  @@index([status])
+  @@map("documents")
+}
+
+// ── Chunks & Embeddings ───────────────────────────────────────────────────────
+
+model Chunk {
+  id              String                 @id @default(uuid())
+  documentId      String
+  projectId       String?
+  chunkIndex      Int?
+  chunkOrder      Int?
+  chunkType       String?
+  content         String
+  contentHash     String?
+  searchContent   String?
+  tokens          Int                    @default(0)
+  metadata        Json                   @default("{}")
+  embedding       Unsupported("vector")?
+  keywords        String[]               @default([])
+  importanceScore Float                  @default(0.0)
+  parentChunkId   String?
+  sectionPath     String?
+  headingPath     String?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+
+  document      Document      @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  project       Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  parentChunk   Chunk?        @relation("ChunkHierarchy", fields: [parentChunkId], references: [id])
+  childChunks   Chunk[]       @relation("ChunkHierarchy")
+  embeddings    Embedding[]
+  chunkMemories ChunkMemory[]
+  memories      Memory[]      @relation("MemorySourceChunk")
+
+  @@index([documentId])
+  @@index([contentHash])
+  @@index([parentChunkId])
+  @@map("chunks")
+}
+
+model Embedding {
+  id          String                @id @default(uuid())
+  chunkId     String
+  model       String
+  dimensions  Int
+  vector      Unsupported("vector")
+  createdAt   DateTime              @default(now())
+
+  chunk Chunk @relation(fields: [chunkId], references: [id], onDelete: Cascade)
+
+  @@index([chunkId])
+  @@index([model])
+  @@map("embeddings")
+}
+
+// ── Memory ────────────────────────────────────────────────────────────────────
+
+model Memory {
+  id             String                 @id @default(uuid())
+  projectId      String?
+  orgId          String?                @default("default")
+  userId         String?
+  sessionId      String?
+  agentId        String?
+  taskId         String?
+
+  memoryType     String                 @default("factual")
+  content        String
+  embedding      Unsupported("vector")?
+  metadata       Json                   @default("{}")
+  scope          String                 @default("USER")
+
+  importance     Float                  @default(0.5)
+  isActive       Boolean                @default(true)
+  accessCount    Int                    @default(0)
+  lastAccessedAt DateTime?
+  recallCount    Int                    @default(0)
+  expiresAt      DateTime?
+
+  documentDate   DateTime?
+  eventDate      DateTime?
+  entityMentions String[]               @default([])
+  confidence     Float                  @default(0.8)
+  sourceChunkId  String?
+  version        Int                    @default(1)
+  validFrom      DateTime?              @default(now())
+  validUntil     DateTime?
+  supersededBy   String?
+
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+
+  project              Project?        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  sourceChunk          Chunk?          @relation("MemorySourceChunk", fields: [sourceChunkId], references: [id], onDelete: SetNull)
+  supersededByMemory   Memory?         @relation("MemoryVersionChain", fields: [supersededBy], references: [id], onDelete: SetNull)
+  supersedes           Memory[]        @relation("MemoryVersionChain")
+  outgoingRelations    MemoryRelation[] @relation("MemoryFrom")
+  incomingRelations    MemoryRelation[] @relation("MemoryTo")
+  chunkMemories        ChunkMemory[]
+
+  @@index([projectId])
+  @@index([orgId])
+  @@index([userId])
+  @@index([sessionId])
+  @@index([agentId])
+  @@index([taskId])
+  @@index([memoryType])
+  @@index([scope])
+  @@index([isActive])
+  @@index([expiresAt])
+  @@index([validFrom, validUntil])
+  @@index([confidence])
+  @@index([supersededBy])
+  @@map("memories")
+}
+
+model MemoryRelation {
+  id           String   @id @default(uuid())
+  fromMemoryId String
+  toMemoryId   String
+  relationType String
+  confidence   Float    @default(0.8)
+  reasoning    String?
+  metadata     Json     @default("{}")
+  createdAt    DateTime @default(now())
+
+  fromMemory Memory @relation("MemoryFrom", fields: [fromMemoryId], references: [id], onDelete: Cascade)
+  toMemory   Memory @relation("MemoryTo", fields: [toMemoryId], references: [id], onDelete: Cascade)
+
+  @@unique([fromMemoryId, toMemoryId, relationType])
+  @@index([fromMemoryId])
+  @@index([toMemoryId])
+  @@map("memory_relations")
+}
+
+model ChunkMemory {
+  id       String @id @default(uuid())
+  chunkId  String
+  memoryId String
+
+  chunk  Chunk  @relation(fields: [chunkId], references: [id], onDelete: Cascade)
+  memory Memory @relation(fields: [memoryId], references: [id], onDelete: Cascade)
+
+  @@unique([chunkId, memoryId])
+  @@map("chunk_memories")
+}
+
+// ── Entities ──────────────────────────────────────────────────────────────────
+
+model Entity {
+  id         String                 @id @default(uuid())
+  documentId String?
+  projectId  String?
+  name       String
+  type       String                 // PERSON | ORG | PLACE | CONCEPT | ...
+  entityType String?
+  description String?
+  aliases    String[]               @default([])
+  embedding  Unsupported("vector")?
+  metadata   Json                   @default("{}")
+  createdAt  DateTime               @default(now())
+  updatedAt  DateTime               @updatedAt
+
+  document         Document?        @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  project          Project?         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  outgoingRelations EntityRelation[] @relation("EntityFrom")
+  incomingRelations EntityRelation[] @relation("EntityTo")
+
+  @@unique([projectId, name, entityType])
+  @@index([projectId])
+  @@index([type])
+  @@map("entities")
+}
+
+model EntityRelation {
+  id           String   @id @default(uuid())
+  projectId    String?
+  fromEntityId String
+  toEntityId   String
+  relationType String
+  weight       Float    @default(1.0)
+  metadata     Json     @default("{}")
+  createdAt    DateTime @default(now())
+
+  project    Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  fromEntity Entity   @relation("EntityFrom", fields: [fromEntityId], references: [id], onDelete: Cascade)
+  toEntity   Entity   @relation("EntityTo", fields: [toEntityId], references: [id], onDelete: Cascade)
+
+  @@unique([fromEntityId, toEntityId, relationType])
+  @@index([projectId])
+  @@map("entity_relations")
+}
+
+// ── Sessions & Messages ───────────────────────────────────────────────────────
+
+model Session {
+  id        String    @id @default(uuid())
+  projectId String?
+  orgId     String    @default("default")
+  sessionId     String?
+  userId        String?
+  agentId       String?
+  taskId        String?
+  title         String?
+  lastMessageAt DateTime?
+  messageCount  Int       @default(0)
+  metadata  Json      @default("{}")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  project  Project?  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([projectId])
+  @@index([userId])
+  @@index([sessionId])
+  @@map("sessions")
+}
+
+model Message {
+  id        String   @id @default(uuid())
+  sessionId String
+  role      String
+  content   String
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("messages")
+}
+
+// ── Shared Context ────────────────────────────────────────────────────────────
+
+model SharedContext {
+  id          String    @id @default(uuid())
+  projectId   String?
+  orgId       String    @default("default")
+  title       String?
+  sessionId   String?
+  userId      String?
+  shareUrl    String?
+  memories    Json      @default("[]")
+  messages    Json      @default("[]")
+  chunks      Json      @default("[]")
+  metadata    Json      @default("{}")
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime?
+  accessCount Int       @default(0)
+
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([shareUrl])
+  @@map("shared_contexts")
+}
+
+// ── SyncJob ───────────────────────────────────────────────────────────────────
+
+model SyncJob {
+  id              String    @id @default(uuid())
+  sourceId        String?
+  sourceVersionId String?
+  type            String    @default("INCREMENTAL")
+  status          String    @default("PENDING")
+  progress        Int       @default(0)
+  traceId         String?
+  parentTraceId   String?
+  error           String?
+  errorMessage    String?
+  errorCode       String?
+  startedAt       DateTime?
+  finishedAt      DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([sourceId])
+  @@index([status])
+  @@map("sync_jobs")
+}
+
+// ── Ingestion ─────────────────────────────────────────────────────────────────
+
+model IngestionJob {
+  id         String   @id @default(uuid())
+  projectId  String?
+  sourceId   String?
+  status     String   @default("pending")
+  type       String
+  payload    Json     @default("{}")
+  result     Json?
+  error      String?
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([status])
+  @@index([type])
+  @@map("ingestion_jobs")
+}
+
+// ── API Idempotency ───────────────────────────────────────────────────────────
+
+model ApiIdempotency {
+  id             String   @id @default(uuid())
+  orgId          String   @default("default")
+  endpoint       String
+  idempotencyKey String
+  requestHash    String
+  statusCode     Int
+  responseBody   Json
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  @@unique([orgId, endpoint, idempotencyKey])
+  @@index([expiresAt])
+  @@map("api_idempotency")
+}
+
+// ── Webhooks ──────────────────────────────────────────────────────────────────
+
+model Webhook {
+  id              String   @id @default(uuid())
+  projectId       String?
+  orgId           String   @default("default")
+  url             String
+  events          String[] @default([])
+  secret          String?
+  isActive        Boolean  @default(true)
+  lastTriggeredAt DateTime?
+  lastDeliveredAt DateTime?
+  lastStatusCode  Int?
+  failureCount    Int      @default(0)
+  lastError       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  deliveries WebhookDelivery[]
+
+  @@index([orgId])
+  @@index([projectId])
+  @@map("webhooks")
+}
+
+model WebhookDelivery {
+  id          String   @id @default(uuid())
+  webhookId   String
+  event       String
+  eventId     String?
+  action      String?
+  attempt     Int      @default(1)
+  durationMs  Int?
+  payload     Json     @default("{}")
+  statusCode  Int?
+  success     Boolean  @default(false)
+  error       String?
+  traceId     String?
+  deliveredAt DateTime?
+  attemptedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId])
+  @@map("webhook_deliveries")
+}

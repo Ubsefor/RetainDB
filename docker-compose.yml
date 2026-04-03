@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: retaindb
+      POSTGRES_PASSWORD: retaindb
+      POSTGRES_DB: retaindb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retaindb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server:
+    build:
+      context: .
+      dockerfile: packages/server/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      DATABASE_URL: "postgresql://retaindb:retaindb@postgres:5432/retaindb"
+      RETAINDB_API_KEY: "${RETAINDB_API_KEY:-changeme}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      EXTRACTION_MODEL: "${EXTRACTION_MODEL:-gpt-4o-mini}"
+      PORT: "3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.local
+*.tsbuildinfo
+.turbo/
+.DS_Store
+Thumbs.db
+prisma/migrations/
+*.db
+*.db-journal
+coverage/
+packages/mcp/
+packages/sdk/

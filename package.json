@@ -1,0 +1,28 @@
+{
+  "name": "retaindb",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Open-source memory and context infrastructure for AI agents",
+  "type": "module",
+  "scripts": {
+    "build": "turbo run build",
+    "build:server": "pnpm --filter @retaindb/server build",
+    "dev": "turbo run dev --parallel",
+    "dev:server": "pnpm --filter @retaindb/server dev",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "typecheck:server": "pnpm --filter @retaindb/server typecheck",
+    "clean": "turbo run clean"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.15.0"
+}
