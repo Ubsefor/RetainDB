@@ -1,0 +1,52 @@
+{
+  "name": "@retaindb/sdk",
+  "version": "1.0.0",
+  "description": "TypeScript SDK for RetainDB — add persistent memory to your AI agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./ai-sdk": {
+      "types": "./dist/adapters/ai-sdk.d.ts",
+      "import": "./dist/adapters/ai-sdk.mjs",
+      "require": "./dist/adapters/ai-sdk.js"
+    },
+    "./tools": {
+      "types": "./dist/adapters/tools.d.ts",
+      "import": "./dist/adapters/tools.mjs",
+      "require": "./dist/adapters/tools.js"
+    },
+    "./router": {
+      "types": "./dist/router/memory-router.d.ts",
+      "import": "./dist/router/memory-router.mjs",
+      "require": "./dist/router/memory-router.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/adapters/ai-sdk.ts src/adapters/tools.ts src/router/memory-router.ts --format esm,cjs --dts --splitting false --out-dir dist",
+    "dev": "tsup src/index.ts --format esm --dts --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["retaindb", "memory", "ai", "llm", "rag", "agents", "context"],
+  "author": "RetainDB",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/retaindb/retaindb"
+  },
+  "homepage": "https://retaindb.com",
+  "bugs": { "url": "https://github.com/retaindb/retaindb/issues" },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": { "node": ">=18.0.0" }
+}

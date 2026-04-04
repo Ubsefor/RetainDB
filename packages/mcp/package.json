@@ -1,0 +1,32 @@
+{
+  "name": "@retaindb/mcp",
+  "version": "1.0.0",
+  "description": "MCP server for RetainDB — connect Claude Desktop and any MCP-compatible agent to your memory store",
+  "type": "module",
+  "bin": { "retaindb-mcp": "./dist/server.js" },
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsup src/server.ts --format esm --out-dir dist",
+    "dev": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["retaindb", "mcp", "model-context-protocol", "claude", "memory", "ai"],
+  "author": "RetainDB",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/retaindb/retaindb"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": { "node": ">=18.0.0" }
+}

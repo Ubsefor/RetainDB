@@ -10,5 +10,3 @@ prisma/migrations/
 *.db
 *.db-journal
 coverage/
-packages/mcp/
-packages/sdk/
