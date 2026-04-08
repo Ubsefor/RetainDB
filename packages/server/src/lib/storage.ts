@@ -7,7 +7,7 @@
  *   -- local --
  *   STORAGE_LOCAL_DIR=./data/files      (default)
  *
- *   -- supabase --
+ *   -- supabase (recommended) --
  *   SUPABASE_URL=https://xxx.supabase.co
  *   SUPABASE_SERVICE_ROLE_KEY=...
  *   SUPABASE_STORAGE_BUCKET=retaindb-files
@@ -23,21 +23,34 @@
  */
 
 import { mkdir, writeFile, readFile, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
+import { join } from "node:path";
 
 export interface StorageBackend {
+  /** Store a file buffer at the given key. */
   put(key: string, data: Buffer, mimeType?: string): Promise<void>;
+  /** Retrieve a file buffer by key. */
   get(key: string): Promise<Buffer>;
+  /** Delete a file by key. */
   delete(key: string): Promise<void>;
+  /**
+   * Return a presigned/redirect URL for the key, or null if the backend
+   * requires inline serving via get().
+   */
   presign(key: string, expiresInSeconds?: number): Promise<string | null>;
 }
 
 // ─── Local filesystem ────────────────────────────────────────────────────────
 
 class LocalStorage implements StorageBackend {
-  constructor(private baseDir: string) {}
+  private baseDir: string;
+
+  constructor(baseDir: string) {
+    this.baseDir = baseDir;
+  }
 
   private resolve(key: string): string {
+    // Sanitise: strip leading slashes, collapse ".." segments
     const safe = key.replace(/\.\./g, "_").replace(/^\/+/, "");
     return join(this.baseDir, safe);
   }
@@ -53,15 +66,22 @@ class LocalStorage implements StorageBackend {
   }
 
   async delete(key: string): Promise<void> {
-    try { await unlink(this.resolve(key)); } catch {}
+    try {
+      await unlink(this.resolve(key));
+    } catch {
+      // File may already be gone — ignore
+    }
   }
 
   async presign(_key: string): Promise<string | null> {
-    return null; // served inline
+    // Local backend serves content inline; no pre-signed URL
+    return null;
   }
 }
 
-// ─── Supabase Storage ─────────────────────────────────────────────────────────
+// ─── Supabase Storage ────────────────────────────────────────────────────────
+// Uses the Supabase Storage REST API directly — no SDK required.
+// Docs: https://supabase.com/docs/guides/storage/restful-api
 
 class SupabaseStorage implements StorageBackend {
   private baseUrl: string;
@@ -124,6 +144,7 @@ class SupabaseStorage implements StorageBackend {
     if (!res.ok) return null;
     const json = await res.json() as { signedURL?: string };
     if (!json.signedURL) return null;
+    // signedURL is a relative path — prefix with the Supabase project URL
     const base = this.baseUrl.replace("/storage/v1", "");
     return json.signedURL.startsWith("http") ? json.signedURL : base + json.signedURL;
   }
@@ -141,7 +162,7 @@ async function buildS3Backend(type: "s3" | "r2"): Promise<StorageBackend> {
   } catch {
     throw new Error(
       `STORAGE_TYPE="${type}" requires @aws-sdk/client-s3 and @aws-sdk/s3-request-presigner. ` +
-      `Run: npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner`
+        `Run: npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner`
     );
   }
 
@@ -150,8 +171,14 @@ async function buildS3Backend(type: "s3" | "r2"): Promise<StorageBackend> {
 
   const clientConfig: Record<string, any> = {
     credentials: {
-      accessKeyId: type === "r2" ? process.env.R2_ACCESS_KEY_ID! : process.env.AWS_ACCESS_KEY_ID!,
-      secretAccessKey: type === "r2" ? process.env.R2_SECRET_ACCESS_KEY! : process.env.AWS_SECRET_ACCESS_KEY!,
+      accessKeyId:
+        type === "r2"
+          ? process.env.R2_ACCESS_KEY_ID!
+          : process.env.AWS_ACCESS_KEY_ID!,
+      secretAccessKey:
+        type === "r2"
+          ? process.env.R2_SECRET_ACCESS_KEY!
+          : process.env.AWS_SECRET_ACCESS_KEY!,
     },
   };
 
@@ -168,20 +195,29 @@ async function buildS3Backend(type: "s3" | "r2"): Promise<StorageBackend> {
 
   return {
     async put(key, data, mimeType) {
-      await client.send(new PutObjectCommand({
-        Bucket: bucket, Key: key, Body: data,
-        ContentType: mimeType || "application/octet-stream",
-      }));
+      await client.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          Body: data,
+          ContentType: mimeType || "application/octet-stream",
+        })
+      );
     },
+
     async get(key) {
       const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
       const chunks: Uint8Array[] = [];
-      for await (const chunk of res.Body as AsyncIterable<Uint8Array>) chunks.push(chunk);
+      for await (const chunk of res.Body as AsyncIterable<Uint8Array>) {
+        chunks.push(chunk);
+      }
       return Buffer.concat(chunks);
     },
+
     async delete(key) {
       await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
     },
+
     async presign(key, expiresInSeconds = 3600) {
       const cmd = new GetObjectCommand({ Bucket: bucket, Key: key });
       return getSignedUrl(client, cmd, { expiresIn: expiresInSeconds });
@@ -199,7 +235,8 @@ export async function getStorageBackend(): Promise<StorageBackend> {
   const type = (process.env.STORAGE_TYPE || "local").toLowerCase() as "local" | "supabase" | "s3" | "r2";
 
   if (type === "local") {
-    _backend = new LocalStorage(process.env.STORAGE_LOCAL_DIR || "./data/files");
+    const dir = process.env.STORAGE_LOCAL_DIR || "./data/files";
+    _backend = new LocalStorage(dir);
   } else if (type === "supabase") {
     const url = process.env.SUPABASE_URL;
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -216,11 +253,14 @@ export async function getStorageBackend(): Promise<StorageBackend> {
   return _backend;
 }
 
+/** Build the canonical storage key for an org's file. */
 export function buildStorageKey(orgId: string, fileId: string, name: string): string {
+  // Sanitise filename — keep extension, replace unsafe chars
   const ext = name.includes(".") ? "." + name.split(".").pop()!.replace(/[^a-z0-9]/gi, "") : "";
   return `orgs/${orgId}/files/${fileId}${ext}`;
 }
 
+/** Build the rdb:// URI used in API responses so agents can reference files. */
 export function buildRdbUri(orgId: string, path: string): string {
   return `rdb://files/${orgId}${path.startsWith("/") ? path : "/" + path}`;
 }
