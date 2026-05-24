@@ -12,7 +12,7 @@ import {
 import type { LearnInput, LearnResult, LearnSourceResult } from "./modules/types.js";
 
 export interface RetainDBConfig {
-  apiKey: string;
+  apiKey?: string;
   baseUrl?: string;
   project?: string;
   timeoutMs?: number;
@@ -408,14 +408,7 @@ export class RetainDBContext {
   private projectCacheExpiresAt = 0;
 
   constructor(config: RetainDBConfig) {
-    if (!config.apiKey) {
-      throw new WhisperError({
-        code: "INVALID_API_KEY",
-        message: "API key is required",
-      });
-    }
-
-    this.apiKey = config.apiKey;
+    this.apiKey = config.apiKey || "";
     this.baseUrl = normalizeBaseUrl(config.baseUrl || "https://api.retaindb.com");
     this.defaultProject = config.project;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -2076,20 +2069,12 @@ export class RetainDBContext {
   };
 }
 
-export { Whisper } from "./whisper-agent.js";
-export { RetainDBClient, WhisperClient } from "./whisper.js";
-export { RetainDBContext as WhisperContext };
-export { RetainDBError, WhisperError };
-export type { RetainDBErrorCode, WhisperErrorCode };
+export { RetainDBClient } from "./whisper.js";
+export { RetainDBError };
+export type { RetainDBErrorCode };
 export type {
   RunContext,
   RetainDBClientConfig,
-  WhisperClientConfig,
-  WhisperEnvironment,
-  WhisperIdentityMode,
-  WhisperPreflightCheck,
-  WhisperPreflightResult,
-  WhisperResolvedIdentity,
   RememberParams,
   IngestParams,
   QueryInput,
@@ -2127,6 +2112,7 @@ export { retaindbTools } from "./adapters/tools.js";
 export type { RetainDBToolDefinition, RetainDBToolsOptions } from "./adapters/tools.js";
 export {
   createMemoryRouter,
+  RetainDBMemoryRouter,
   type MemoryRouterConfig,
   type MemoryRouterResult,
   type MemoryRouterTrace,
@@ -2135,8 +2121,8 @@ export {
 export { memoryGraphToMermaid } from "./graph-utils.js";
 export { FilesModule } from "./modules/files.js";
 export type { SharedFile, FileScope, StoreOptions, StoreResult } from "./modules/files.js";
-export default RetainDBContext;
+export { RetainDB as default } from "./retaindb.js";
 
 // Primary SDK — use RetainDB for new projects
 export { RetainDB } from "./retaindb.js";
-export type { RetainDBOptions, Message, TurnContext, UserScope, SessionScope, MemoryItem } from "./retaindb.js";
+export type { RetainDBOptions, Message, TurnContext, UserScope, SessionScope, AgentScope, AgentWorkEvent, MemoryItem } from "./retaindb.js";

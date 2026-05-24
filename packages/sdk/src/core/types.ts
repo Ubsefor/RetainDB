@@ -40,7 +40,7 @@ export interface RuntimeRequestOptions {
 }
 
 export interface RuntimeClientOptions {
-  apiKey: string;
+  apiKey?: string;
   baseUrl?: string;
   sdkVersion?: string;
   compatMode?: CompatMode;

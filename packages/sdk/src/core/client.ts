@@ -94,14 +94,7 @@ export class RuntimeClient {
   private readonly fetchImpl: typeof fetch;
 
   constructor(options: RuntimeClientOptions, diagnostics?: DiagnosticsStore) {
-    if (!options.apiKey) {
-      throw new RuntimeClientError({
-        code: "INVALID_API_KEY",
-        message: "API key is required",
-        retryable: false,
-      });
-    }
-    this.apiKey = options.apiKey;
+    this.apiKey = options.apiKey || "";
     this.baseUrl = normalizeBaseUrl(options.baseUrl || "https://api.retaindb.com");
     this.sdkVersion = options.sdkVersion || "2.x-runtime";
     this.compatMode = options.compatMode || "fallback";
@@ -259,14 +252,19 @@ export class RuntimeClient {
 
       try {
         const attachApiKeyHeader = this.shouldAttachApiKeyHeader(normalizedEndpoint);
+        const authHeaders = this.apiKey
+          ? {
+              Authorization: this.apiKey.startsWith("Bearer ") ? this.apiKey : `Bearer ${this.apiKey}`,
+              ...(attachApiKeyHeader ? { "X-API-Key": this.apiKey.replace(/^Bearer\s+/i, "") } : {}),
+            }
+          : {};
         const response = await this.fetchImpl(`${this.baseUrl}${normalizedEndpoint}`, {
           method,
           signal: controller.signal,
           keepalive: method !== "GET",
           headers: {
             "Content-Type": "application/json",
-            Authorization: this.apiKey.startsWith("Bearer ") ? this.apiKey : `Bearer ${this.apiKey}`,
-            ...(attachApiKeyHeader ? { "X-API-Key": this.apiKey.replace(/^Bearer\s+/i, "") } : {}),
+            ...authHeaders,
             "x-trace-id": traceId,
             "x-span-id": spanId,
             "x-sdk-version": this.sdkVersion,

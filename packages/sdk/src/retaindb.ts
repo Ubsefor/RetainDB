@@ -136,6 +136,26 @@ export interface SessionLearnScope {
   };
 }
 
+export type AgentWorkEvent = {
+  kind: "decision" | "constraint" | "outcome" | "failure" | "task_update" | "file_edit" | "tool_result";
+  summary: string;
+  details?: string;
+  salience?: "low" | "medium" | "high";
+  timestamp?: string;
+  filePaths?: string[];
+  toolName?: string;
+  success?: boolean;
+};
+
+export interface AgentScope {
+  task(taskId: string): AgentScope;
+  context(query: string, opts?: { sessionId?: string; userId?: string; topK?: number }): Promise<{ context: string; raw: MemorySearchResponse }>;
+  recall(query: string, opts?: { sessionId?: string; userId?: string; topK?: number }): Promise<MemoryItem[]>;
+  event(event: AgentWorkEvent, opts?: { sessionId?: string; userId?: string; taskId?: string }): Promise<void>;
+  remember(content: string, opts?: { sessionId?: string; userId?: string; taskId?: string }): Promise<void>;
+  handoff(opts: { sessionId: string; title?: string; expiryDays?: number }): Promise<{ shareId: string; shareUrl?: string }>;
+}
+
 export class RetainDB {
   private readonly memory: MemoryModule;
   readonly files: FilesModule;
@@ -148,12 +168,6 @@ export class RetainDB {
       opts.apiKey ||
       (typeof process !== "undefined" && (process.env.RETAINDB_KEY || process.env.RETAINDB_API_KEY)) ||
       "";
-
-    if (!apiKey) {
-      throw new Error(
-        "RetainDB: API key is required. Pass apiKey or set RETAINDB_KEY in your environment."
-      );
-    }
 
     const project =
       opts.project ||
@@ -492,6 +506,103 @@ export class RetainDB {
     };
 
     return { getContext, searchMemory, listMemory, remember, forget, session, runTurn };
+  }
+
+  /** Create an agent-scoped helper for local agent-memory workflows. */
+  agent(agentId: string, baseTaskId?: string): AgentScope {
+    if (!agentId || !agentId.trim()) throw new Error("RetainDB: agentId is required and cannot be empty");
+    const memory = this.memory;
+    const project = this.project;
+    const currentAgentId = agentId.trim();
+
+    const scopeFor = (taskId?: string): AgentScope => {
+      const currentTaskId = taskId || baseTaskId;
+      const context = async (
+        query: string,
+        opts: { sessionId?: string; userId?: string; topK?: number } = {},
+      ): Promise<{ context: string; raw: MemorySearchResponse }> => {
+        const raw = await memory.search({
+          project,
+          query,
+          top_k: opts.topK ?? 10,
+          include_pending: true,
+          profile: "balanced",
+          user_id: opts.userId,
+          session_id: opts.sessionId,
+          agent_id: currentAgentId,
+          task_id: currentTaskId,
+        });
+        return { context: formatContext(raw), raw };
+      };
+
+      const recall = async (
+        query: string,
+        opts: { sessionId?: string; userId?: string; topK?: number } = {},
+      ): Promise<MemoryItem[]> => {
+        const raw = await context(query, opts);
+        return extractMemoryItems(raw.raw);
+      };
+
+      const remember = async (
+        content: string,
+        opts: { sessionId?: string; userId?: string; taskId?: string } = {},
+      ): Promise<void> => {
+        if (!content.trim()) return;
+        await memory.add({
+          project,
+          content,
+          memory_type: "factual",
+          user_id: opts.userId,
+          session_id: opts.sessionId,
+          agent_id: currentAgentId,
+          task_id: opts.taskId || currentTaskId,
+          write_mode: "async",
+        });
+      };
+
+      const event = async (
+        workEvent: AgentWorkEvent,
+        opts: { sessionId?: string; userId?: string; taskId?: string } = {},
+      ): Promise<void> => {
+        const prefix = workEvent.kind.replace(/_/g, " ");
+        const details = workEvent.details ? `\n${workEvent.details}` : "";
+        await remember(`${prefix}: ${workEvent.summary}${details}`, {
+          ...opts,
+          taskId: opts.taskId || currentTaskId,
+        });
+      };
+
+      const handoff = async (opts: { sessionId: string; title?: string; expiryDays?: number }) => {
+        const response = await this._client.request<any>({
+          endpoint: "/v1/context/share",
+          method: "POST",
+          operation: "session",
+          body: {
+            project,
+            session_id: opts.sessionId,
+            title: opts.title || `Agent handoff: ${currentTaskId || currentAgentId}`,
+            include_memories: true,
+            include_chunks: false,
+            expiry_days: opts.expiryDays ?? 7,
+          },
+        });
+        return {
+          shareId: String(response.data?.share_id || ""),
+          shareUrl: response.data?.share_url ? String(response.data.share_url) : undefined,
+        };
+      };
+
+      return {
+        task: (nextTaskId: string) => scopeFor(nextTaskId),
+        context,
+        recall,
+        event,
+        remember,
+        handoff,
+      };
+    };
+
+    return scopeFor(baseTaskId);
   }
 
   /**

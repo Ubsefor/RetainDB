@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "description": "MCP server for RetainDB — connect Claude Desktop and any MCP-compatible agent to your memory store",
   "type": "module",
-  "bin": { "retaindb-mcp": "./dist/server.js" },
+  "bin": {
+    "retaindb-mcp": "./dist/server.js",
+    "retaindb-agent-setup": "./dist/setup-agent.js"
+  },
   "main": "dist/server.js",
   "scripts": {
-    "build": "tsup src/server.ts --format esm --out-dir dist",
+    "build": "tsup src/server.ts src/setup-agent.ts --format esm --out-dir dist",
     "dev": "tsx src/server.ts",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"

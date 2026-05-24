@@ -7,7 +7,7 @@ import { readdirSync, readFileSync, statSync } from "fs";
 import { join, relative, extname } from "path";
 import { userInfo } from "os";
 import { createHash } from "crypto";
-import { RetainDBContext as WhisperContext } from "../sdk/index.js";
+import { RetainDBContext } from "../sdk/index.js";
 import {
   buildMcpSearchPayload,
   buildPrimaryToolSuccess,
@@ -18,25 +18,12 @@ import {
 
 const API_KEY = process.env.RETAINDB_API_KEY || "";
 const DEFAULT_PROJECT = process.env.RETAINDB_PROJECT || "";
-const BASE_URL = process.env.RETAINDB_BASE_URL;
+const BASE_URL = process.env.RETAINDB_BASE_URL || "http://localhost:3000";
 
 // ─── Client bootstrap ──────────────────────────────────────────────────────
 
-function makeGuard<T extends object>(label: string): T {
-  return new Proxy({} as T, {
-    get(_t, prop) {
-      if (typeof prop === "string" && !["then", "catch", "finally"].includes(prop)) {
-        return async () => {
-          throw new Error(`${label}: RETAINDB_API_KEY is not configured.`);
-        };
-      }
-    },
-  });
-}
-
-function makeClient(): WhisperContext {
-  if (!API_KEY) return makeGuard<WhisperContext>("retaindb");
-  return new WhisperContext({
+function makeClient(): RetainDBContext {
+  return new RetainDBContext({
     apiKey: API_KEY,
     project: DEFAULT_PROJECT,
     ...(BASE_URL ? { baseUrl: BASE_URL } : {}),
@@ -201,6 +188,17 @@ type CanonicalSourceType = "github" | "web" | "playwright" | "pdf" | "local" | "
 
 // ─── Tools ─────────────────────────────────────────────────────────────────
 
+const workEventSchema = z.object({
+  kind: z.enum(["decision", "constraint", "outcome", "failure", "task_update", "file_edit", "tool_result"]),
+  summary: z.string(),
+  details: z.string().optional(),
+  salience: z.enum(["low", "medium", "high"]).optional(),
+  timestamp: z.string().optional(),
+  filePaths: z.array(z.string()).optional(),
+  toolName: z.string().optional(),
+  success: z.boolean().optional(),
+});
+
 // 1. CONTEXT — retrieve + auto-store in one call
 server.tool(
   "context",
@@ -300,6 +298,174 @@ server.tool(
         remote_results: remoteResults,
         memories,
         count: localResults.length + remoteResults.length + memories.length,
+      });
+    } catch (error: any) {
+      return err(error.message);
+    }
+  }
+);
+
+server.tool(
+  "agent_event",
+  "Auto-capture a coding-agent work event. Use this from hooks after prompts, tool calls, file edits, failures, compaction, and session end. Events are stored locally as task/session memory.",
+  {
+    event: workEventSchema,
+    session_id: z.string().optional(),
+    agent_id: z.string().optional(),
+    task_id: z.string().optional(),
+  },
+  async ({ event, session_id, agent_id, task_id }) => {
+    try {
+      const project = await resolveProject();
+      const userId = defaultUserId();
+      const sid = session_id?.trim() || `session-${Date.now()}`;
+      const result = await client.ingestSession({
+        project,
+        session_id: sid,
+        user_id: userId,
+        agent_id,
+        task_id,
+        messages: [],
+        events: [{ ...event, timestamp: event.timestamp || new Date().toISOString() }],
+        promotion_mode: "session_state_v1",
+      });
+      return ok({
+        tool: "agent_event",
+        stored: true,
+        project,
+        session_id: sid,
+        agent_id,
+        task_id,
+        memories_created: (result as any)?.memories_created ?? null,
+      });
+    } catch (error: any) {
+      return err(error.message);
+    }
+  }
+);
+
+server.tool(
+  "recall",
+  "Recall memories relevant to a task, agent, session, or project. This is the direct memory-search companion to `context`.",
+  {
+    query: z.string().describe("What the agent needs to remember"),
+    session_id: z.string().optional(),
+    agent_id: z.string().optional(),
+    task_id: z.string().optional(),
+    top_k: z.number().optional().default(10),
+  },
+  async ({ query, session_id, agent_id, task_id, top_k }) => {
+    try {
+      const project = await resolveProject();
+      const response = await client.searchMemories({
+        project,
+        query,
+        user_id: defaultUserId(),
+        session_id: session_id?.trim(),
+        agent_id,
+        task_id,
+        top_k,
+        include_pending: true,
+        profile: "balanced",
+      });
+      const results = (response as any).results || (response as any).memories || [];
+      return ok({
+        tool: "recall",
+        query,
+        project,
+        results,
+        count: Array.isArray(results) ? results.length : 0,
+        trace_id: (response as any).trace_id,
+      });
+    } catch (error: any) {
+      return err(error.message);
+    }
+  }
+);
+
+server.tool(
+  "session_history",
+  "List recent memories for a specific session. Use this before handoff or when a new agent needs to understand what happened earlier.",
+  {
+    session_id: z.string(),
+    limit: z.number().optional().default(30),
+  },
+  async ({ session_id, limit }) => {
+    try {
+      const project = await resolveProject();
+      const response = await client.getSessionMemories({
+        project,
+        session_id: session_id.trim(),
+        include_pending: true,
+        limit,
+      });
+      const memories = (response as any).memories || [];
+      return ok({
+        tool: "session_history",
+        session_id,
+        memories,
+        count: (response as any).count ?? memories.length,
+      });
+    } catch (error: any) {
+      return err(error.message);
+    }
+  }
+);
+
+server.tool(
+  "handoff",
+  "Create a handoff packet so another agent can continue the task with the right session memory. This uses RetainDB shared context locally and returns a share id.",
+  {
+    session_id: z.string(),
+    title: z.string().optional(),
+    to_agent_id: z.string().optional(),
+    task_id: z.string().optional(),
+    expiry_days: z.number().optional().default(7),
+  },
+  async ({ session_id, title, to_agent_id, task_id, expiry_days }) => {
+    try {
+      const project = await resolveProject();
+      const result = await client.createSharedContext({
+        project,
+        session_id: session_id.trim(),
+        title: title || `Agent handoff: ${task_id || session_id}`,
+        include_memories: true,
+        include_chunks: false,
+        expiry_days,
+      });
+      return ok({
+        tool: "handoff",
+        project,
+        session_id,
+        to_agent_id,
+        task_id,
+        ...result,
+      });
+    } catch (error: any) {
+      return err(error.message);
+    }
+  }
+);
+
+server.tool(
+  "resume_handoff",
+  "Resume a handoff packet into a new local session for the current agent.",
+  {
+    share_id: z.string(),
+    new_session_id: z.string().optional(),
+  },
+  async ({ share_id, new_session_id }) => {
+    try {
+      const project = await resolveProject();
+      const result = await client.resumeFromSharedContext({
+        project,
+        share_id,
+        new_session_id,
+      });
+      return ok({
+        tool: "resume_handoff",
+        share_id,
+        ...result,
       });
     } catch (error: any) {
       return err(error.message);
@@ -741,13 +907,9 @@ async function startupProbe() {
 }
 
 async function main() {
-  if (!API_KEY) {
-    console.error("Error: RETAINDB_API_KEY is required");
-    process.exit(1);
-  }
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("[retaindb-mcp] running on stdio");
+  console.error(`[retaindb-mcp] running on stdio (${API_KEY ? "authenticated" : "local no-key mode"}, ${BASE_URL})`);
   startupProbe().catch(() => {});
 }
 

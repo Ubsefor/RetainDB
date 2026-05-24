@@ -9,6 +9,8 @@
     "build:server": "pnpm --filter @retaindb/server build",
     "dev": "turbo run dev --parallel",
     "dev:server": "pnpm --filter @retaindb/server dev",
+    "local": "pnpm --filter @retaindb/server dev",
+    "agent:setup": "pnpm --filter @retaindb/mcp exec tsx src/setup-agent.ts --write",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "typecheck:server": "pnpm --filter @retaindb/server typecheck",

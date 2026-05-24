@@ -1,5 +1,5 @@
-import { RetainDBError as WhisperError } from "../errors.js";
-import { RetainDBClient as WhisperClient, type RetainDBClientConfig as WhisperClientConfig } from "../whisper.js";
+import { RetainDBError } from "../errors.js";
+import { RetainDBClient, type RetainDBClientConfig } from "../whisper.js";
 
 type ChatMessage = {
   role: string;
@@ -34,9 +34,9 @@ export interface MemoryRouterResult<T = unknown> {
 }
 
 export interface MemoryRouterConfig
-  extends Partial<Omit<WhisperClientConfig, "apiKey">> {
+  extends Partial<Omit<RetainDBClientConfig, "apiKey">> {
   apiKey?: string;
-  client?: WhisperClient;
+  client?: RetainDBClient;
   project?: string;
   providerBaseUrl: string;
   providerApiKey?: string;
@@ -90,7 +90,7 @@ function extractUserPrompt(messages: ChatMessage[] | undefined): string {
   return "";
 }
 
-function buildClient(config: MemoryRouterConfig): WhisperClient {
+function buildClient(config: MemoryRouterConfig): RetainDBClient {
   if (config.client) return config.client;
 
   const env = (typeof process !== "undefined" ? process.env : {}) as Record<
@@ -104,7 +104,7 @@ function buildClient(config: MemoryRouterConfig): WhisperClient {
     env.USEWHISPER_API_KEY ||
     env.API_KEY;
   if (!apiKey) {
-    throw new WhisperError({
+    throw new RetainDBError({
       code: "INVALID_API_KEY",
       message:
         "Missing API key. Pass apiKey to createMemoryRouter(...) or set RETAINDB_API_KEY.",
@@ -112,7 +112,7 @@ function buildClient(config: MemoryRouterConfig): WhisperClient {
     });
   }
 
-  return new WhisperClient({
+  return new RetainDBClient({
     apiKey,
     baseUrl: config.baseUrl,
     project: config.project,
@@ -134,11 +134,11 @@ function ensureBetaEnabled(_explicitBeta?: boolean): void {
   // Memory Router is production-ready. No opt-in required.
 }
 
-export class WhisperMemoryRouter {
+export class RetainDBMemoryRouter {
   private readonly config: MemoryRouterConfig;
   private readonly providerUrl: string;
   private readonly fetchImpl: typeof fetch;
-  private client: WhisperClient | null = null;
+  private client: RetainDBClient | null = null;
   private lastTrace: MemoryRouterTrace | null = null;
 
   constructor(config: MemoryRouterConfig) {
@@ -151,7 +151,7 @@ export class WhisperMemoryRouter {
     this.fetchImpl = config.fetch || fetch;
   }
 
-  private getClient(): WhisperClient {
+  private getClient(): RetainDBClient {
     if (!this.client) this.client = buildClient(this.config);
     return this.client;
   }
@@ -245,7 +245,7 @@ export class WhisperMemoryRouter {
     if (this.config.logger) this.config.logger(trace);
 
     if (!response.ok) {
-      throw new WhisperError({
+      throw new RetainDBError({
         code: response.status >= 500 ? "TEMPORARY_UNAVAILABLE" : "REQUEST_FAILED",
         status: response.status,
         message:
@@ -270,7 +270,7 @@ export class WhisperMemoryRouter {
   }
 }
 
-export function createMemoryRouter(config: MemoryRouterConfig): WhisperMemoryRouter {
-  return new WhisperMemoryRouter(config);
+export function createMemoryRouter(config: MemoryRouterConfig): RetainDBMemoryRouter {
+  return new RetainDBMemoryRouter(config);
 }
 
