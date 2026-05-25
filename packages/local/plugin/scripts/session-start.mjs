@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { capture } from "./_capture.mjs";
+import { capture, printContextPack } from "./_capture.mjs";
 
 const BASE_URL = (process.env.RETAINDB_BASE_URL || "http://localhost:3111").replace(/\/+$/, "");
 
@@ -23,6 +23,7 @@ try {
     const body = await res.json();
     if (body.context) process.stdout.write(body.context);
   }
+  await printContextPack(data, "session_start", "project decisions workflows open tasks relevant files");
 } catch {
   await capture("session_start");
 }

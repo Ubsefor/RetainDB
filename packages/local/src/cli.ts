@@ -1511,15 +1511,17 @@ function installClaudeConfig(baseUrl: string, project: string) {
   const config = readJsonFile(path);
   config.mcpServers = {
     ...(config.mcpServers || {}),
-    retaindb: { command: "npx", args: ["-y", "@retaindb/local", "mcp"], env: mcpEnv(baseUrl, project) },
+    retaindb: { command: "npx", args: ["-y", "@retaindb/local", "mcp"], env: { ...mcpEnv(baseUrl, project), RETAINDB_AUTO_CONTEXT: "true", RETAINDB_TOKEN_BUDGET: "1200", RETAINDB_COMPRESS_TOOL_OUTPUT: "true" } },
   };
   writeJsonFile(path, config);
   const settingsPath = join(homedir(), ".claude", "settings.json");
   const settings = readJsonFile(settingsPath);
   settings.hooks = {
     ...(settings.hooks || {}),
-    UserPromptSubmit: [{ hooks: [{ type: "command", command: "npx -y @retaindb/local hook --kind=prompt --agent=claude-code" }] }],
-    PostToolUse: [{ hooks: [{ type: "command", command: "npx -y @retaindb/local hook --kind=tool_result --agent=claude-code" }] }],
+    UserPromptSubmit: [{ hooks: [{ type: "command", command: "npx -y @retaindb/local hook --kind=prompt --agent=claude-code", env: { RETAINDB_AUTO_CONTEXT: "true", RETAINDB_TOKEN_BUDGET: "1200" } }] }],
+    PreToolUse: [{ hooks: [{ type: "command", command: "npx -y @retaindb/local hook --kind=pre_tool_use --agent=claude-code", env: { RETAINDB_AUTO_CONTEXT: "true", RETAINDB_TOKEN_BUDGET: "1200" } }] }],
+    PostToolUse: [{ hooks: [{ type: "command", command: "npx -y @retaindb/local hook --kind=tool_result --agent=claude-code", env: { RETAINDB_COMPRESS_TOOL_OUTPUT: "true", RETAINDB_TOKEN_BUDGET: "1200" } }] }],
+    PreCompact: [{ hooks: [{ type: "command", command: "npx -y @retaindb/local hook --kind=pre_compact --agent=claude-code", env: { RETAINDB_AUTO_CONTEXT: "true", RETAINDB_TOKEN_BUDGET: "1200" } }] }],
     Stop: [{ hooks: [{ type: "command", command: "npx -y @retaindb/local hook --kind=session_end --agent=claude-code" }] }],
   };
   writeJsonFile(settingsPath, settings);
@@ -1647,15 +1649,63 @@ async function runHook() {
   if (!process.stdin.isTTY) {
     for await (const chunk of process.stdin) stdin += chunk;
   }
+  let data: any = {};
+  try {
+    data = stdin.trim() ? JSON.parse(stdin) : {};
+  } catch {
+    data = { raw: stdin.slice(0, 12000) };
+  }
+  const project = process.env.RETAINDB_PROJECT || data.project || data.cwd || DEFAULT_PROJECT;
+  const autoContext = process.env.RETAINDB_AUTO_CONTEXT !== "false" && ["prompt", "pre_tool_use", "pre_compact"].includes(kind);
+  if (autoContext) {
+    try {
+      const res = await fetch(`${baseUrl}/v1/context/pack`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project,
+          query: summaryArg || data.prompt || data.message || data.tool_input || data.tool_name || kind,
+          cwd: data.cwd || process.cwd(),
+          files: data.files || data.filePaths || data.paths || [],
+          previous_context_hash: data.previous_context_hash || data.context_hash,
+          token_budget: Number(process.env.RETAINDB_TOKEN_BUDGET || 1200),
+        }),
+      });
+      if (res.ok) {
+        const body = await res.json();
+        const text = body.delta_context || body.context;
+        if (text) process.stdout.write(`\nRetainDB compact context:\n${text}\n`);
+      }
+    } catch {}
+  }
+  if (process.env.RETAINDB_COMPRESS_TOOL_OUTPUT !== "false" && (data.tool_output || data.tool_response)) {
+    try {
+      const raw = String(data.tool_output || data.tool_response);
+      if (raw.length > 1200) {
+        const res = await fetch(`${baseUrl}/v1/context/compress-output`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ output: raw, token_budget: Number(process.env.RETAINDB_TOKEN_BUDGET || 1200) }),
+        });
+        if (res.ok) {
+          const body = await res.json();
+          data.tool_output = body.compressed || raw.slice(0, 4000);
+          data.tool_response = data.tool_output;
+          data.output_compressed = true;
+          data.raw_output_hash = createHash("sha256").update(raw).digest("hex");
+        }
+      }
+    } catch {}
+  }
   const summary = summaryArg || stdin.slice(0, 4000).trim() || `${agentId} ${kind}`;
   await fetch(`${baseUrl}/v1/agent-events`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      project: process.env.RETAINDB_PROJECT || DEFAULT_PROJECT,
+      project,
       session_id: sessionId,
       agent_id: agentId,
-      event: { kind, summary, details: stdin.slice(0, 12000), timestamp: now() },
+      event: { kind, summary, details: JSON.stringify(data).slice(0, 12000), timestamp: now() },
     }),
   }).catch(() => {});
 }
