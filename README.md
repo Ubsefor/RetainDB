@@ -32,6 +32,8 @@ Agents are most useful when they remember the right things and forget the noise.
 - **Retrieve** with lexical search, vector similarity, graph signals, RRF fusion, and reranking.
 - **Reinforce** memories that get reused, so important knowledge gets stronger over time.
 - **Handoff** context between sessions, agents, and workflows.
+- **Route** normal coding context so agents stop rereading whole files, logs, and sessions every turn.
+- **Compress** repeated context with deltas, hard token budgets, and tool-output cleanup.
 
 ## Quick Start
 
@@ -110,6 +112,10 @@ What it includes:
 - Consolidation with duplicate cleanup, session rollups, and stale weak-memory decay
 - Optional local transformer embeddings
 - Local benchmark reports in `~/.retaindb/benchmarks/`
+- Token-budgeted context packs for files, memory, code maps, and tool output
+- Delta compression so agents receive only what changed since the last context pack
+- Tool-output compression that keeps errors, failing tests, and stack traces while dropping noise
+- Code maps that show relevant files and symbols without dumping the whole repo
 
 Useful commands:
 
@@ -133,6 +139,40 @@ RETAINDB_EMBEDDING_PROVIDER=local-transformers retaindb reembed
 ```
 
 If the local native embedding runtime is unavailable, RetainDB falls back to hash-vector embeddings so local memory keeps working.
+
+### Context Router and Token Reduction
+
+RetainDB Local can also act as a local context router for coding agents. Instead of sending huge files, repeated terminal logs, or the same project summary every turn, agents can ask RetainDB for a compact context pack.
+
+```bash
+curl -X POST http://localhost:3111/v1/context/pack \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "fix auth middleware tests",
+    "cwd": ".",
+    "files": ["src/auth.ts", "tests/auth.test.ts"],
+    "token_budget": 1200
+  }'
+```
+
+The response includes:
+
+- `context`: packed memory, relevant file chunks, code map, and compressed tool output
+- `context_hash`: stable hash for the pack
+- `delta_context`: only the changed parts when `previous_context_hash` is supplied
+- `estimated_tokens` and `estimated_delta_tokens`
+- `changed` and `removed` entries for delta-aware agents
+
+Useful endpoints:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/context/pack` | Build a token-budgeted context pack |
+| `POST` | `/v1/context/delta` | Return only context changes since a previous pack |
+| `POST` | `/v1/context/compress-output` | Compress test/build/tool output |
+| `POST` | `/v1/context/code-map` | Build a compact file and symbol map |
+
+MCP tools expose the same flow as `context_pack`, `context_delta`, `compress_output`, and `code_map`.
 
 ## Platform Features
 
@@ -297,6 +337,10 @@ If `RETAINDB_API_KEY` is set, protected deployments require `Authorization: Bear
 | `POST` | `/v1/memory/bulk` | Store multiple memories |
 | `POST` | `/v1/memory/search` | Search memories |
 | `POST` | `/v1/context/query` | Retrieve packed context |
+| `POST` | `/v1/context/pack` | Build a token-budgeted coding context pack |
+| `POST` | `/v1/context/delta` | Return changed context since a prior pack |
+| `POST` | `/v1/context/compress-output` | Compress noisy tool output |
+| `POST` | `/v1/context/code-map` | Return relevant files and symbols |
 | `POST` | `/v1/memory/ingest/session` | Ingest messages and work events |
 | `GET` | `/v1/memory/session/:sessionId` | List session memories |
 | `GET` | `/v1/memory/profile/:userId` | List profile memories |

@@ -34,6 +34,17 @@ retaindb reembed         # refresh vectors with the configured embedding provide
 retaindb doctor          # print local runtime status
 ```
 
+## Context Router
+
+RetainDB Local can reduce normal coding-agent token use, not just memory tokens.
+
+- `POST /v1/context/pack` builds a token-budgeted pack from memory, relevant file chunks, code map, and compressed tool output.
+- `POST /v1/context/delta` returns only what changed since a previous `context_hash`.
+- `POST /v1/context/compress-output` keeps errors, failing tests, and stack traces while dropping log noise.
+- `POST /v1/context/code-map` returns relevant files and symbols without dumping the repo.
+
+The bundled MCP bridge exposes `context_pack`, `context_delta`, `compress_output`, and `code_map`.
+
 Optional local model embeddings:
 
 ```bash

@@ -46,7 +46,14 @@ type Share = {
   created_at: string;
   expires_at?: string;
 };
-type StoreData = { projects: Project[]; memories: Memory[]; shares: Share[] };
+type ContextSnapshot = {
+  hash: string;
+  project: string;
+  query: string;
+  entries: Array<{ kind: string; id: string; hash: string; title: string; content: string }>;
+  created_at: string;
+};
+type StoreData = { projects: Project[]; memories: Memory[]; shares: Share[]; contextSnapshots: ContextSnapshot[] };
 
 const STOP_WORDS = new Set(["the", "and", "for", "that", "with", "this", "from", "into", "user", "agent", "session", "tool", "used", "uses", "using"]);
 const RRF_K = 60;
@@ -63,6 +70,8 @@ const STORE_PATH = resolve(process.env.RETAINDB_STORE || join(RETAINDB_HOME, "lo
 const JOURNAL_PATH = `${STORE_PATH}.journal.jsonl`;
 const BENCHMARK_DIR = join(RETAINDB_HOME, "benchmarks");
 const EMBEDDING_PROVIDER = process.env.RETAINDB_EMBEDDING_PROVIDER || "hash";
+const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", ".next", "coverage", ".turbo", ".cache", ".vercel", ".wrangler"]);
+const CODE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rs", ".go", ".java", ".cs", ".rb", ".php", ".md", ".mdx", ".json", ".toml", ".yaml", ".yml", ".css", ".scss", ".html", ".sql"]);
 let transformerPipeline: Promise<any> | null = null;
 
 function now() {
@@ -80,6 +89,20 @@ function tokenize(text: string) {
 
 function uniqueTokens(text: string) {
   return Array.from(new Set(tokenize(text)));
+}
+
+function hashString(text: string) {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+function estimateTokens(text: string) {
+  return Math.ceil(text.length / 4);
+}
+
+function truncateTokens(text: string, tokenBudget: number) {
+  const maxChars = Math.max(0, tokenBudget * 4);
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars).replace(/\s+\S*$/, "")}\n[trimmed to ${tokenBudget} token budget]`;
 }
 
 function concepts(text: string, limit = 10) {
@@ -195,6 +218,7 @@ function loadStore(): StoreData {
       projects: [{ id: "proj_default", name: "default", slug: "default", created_at: created }],
       memories: [],
       shares: [],
+      contextSnapshots: [],
     };
   }
   const parsed = JSON.parse(readFileSync(STORE_PATH, "utf8")) as Partial<StoreData>;
@@ -202,6 +226,7 @@ function loadStore(): StoreData {
     projects: Array.isArray(parsed.projects) ? parsed.projects : [],
     memories: Array.isArray(parsed.memories) ? parsed.memories : [],
     shares: Array.isArray(parsed.shares) ? parsed.shares : [],
+    contextSnapshots: Array.isArray(parsed.contextSnapshots) ? parsed.contextSnapshots : [],
   };
 }
 
@@ -223,6 +248,117 @@ function writeBenchmarkReport(report: Record<string, unknown>) {
   const path = join(BENCHMARK_DIR, `local-${stamp}.json`);
   writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   return path;
+}
+
+function isTextCodeFile(path: string) {
+  return CODE_EXTENSIONS.has(path.slice(path.lastIndexOf(".")).toLowerCase());
+}
+
+function listCodeFiles(root: string, limit = 400): string[] {
+  const out: string[] = [];
+  const walk = (dir: string) => {
+    if (out.length >= limit) return;
+    let entries: any[] = [];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (out.length >= limit) break;
+      if (entry.name.startsWith(".") && entry.name !== ".env.example") continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name)) walk(full);
+      } else if (entry.isFile() && isTextCodeFile(entry.name)) {
+        try {
+          if (statSync(full).size <= 240_000) out.push(full);
+        } catch {}
+      }
+    }
+  };
+  walk(resolve(root));
+  return out;
+}
+
+function extractSymbols(text: string) {
+  const symbols: string[] = [];
+  const patterns = [
+    /^\s*export\s+(?:async\s+)?function\s+([A-Za-z0-9_$]+)/gm,
+    /^\s*(?:async\s+)?function\s+([A-Za-z0-9_$]+)/gm,
+    /^\s*(?:export\s+)?class\s+([A-Za-z0-9_$]+)/gm,
+    /^\s*(?:export\s+)?const\s+([A-Za-z0-9_$]+)\s*=/gm,
+    /^\s*(?:def|class)\s+([A-Za-z0-9_]+)/gm,
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) symbols.push(match[1]);
+  }
+  return Array.from(new Set(symbols)).slice(0, 30);
+}
+
+function codeMap(root: string, query = "", limit = 80) {
+  const q = new Set(uniqueTokens(query));
+  return listCodeFiles(root)
+    .map((file) => {
+      const rel = file.replace(resolve(root), "").replace(/^[/\\]/, "");
+      let text = "";
+      try {
+        text = readFileSync(file, "utf8");
+      } catch {}
+      const symbols = extractSymbols(text);
+      const haystack = `${rel} ${symbols.join(" ")}`.toLowerCase();
+      const score = [...q].reduce((sum, token) => sum + (haystack.includes(token) ? 1 : 0), 0);
+      return { file: rel, symbols, score, lines: text.split(/\r?\n/).length, hash: hashString(text).slice(0, 16) };
+    })
+    .sort((a, b) => b.score - a.score || a.file.localeCompare(b.file))
+    .slice(0, limit);
+}
+
+function packFileChunks(root: string, files: string[], query: string, tokenBudget: number) {
+  const qTokens = uniqueTokens(query).filter((token) => !STOP_WORDS.has(token));
+  const chunks: Array<{ file: string; content: string; hash: string; tokens: number }> = [];
+  for (const input of files.slice(0, 24)) {
+    const full = resolve(root, input);
+    if (!full.startsWith(resolve(root)) || !existsSync(full)) continue;
+    let text = "";
+    try {
+      if (statSync(full).size > 240_000) continue;
+      text = readFileSync(full, "utf8");
+    } catch {
+      continue;
+    }
+    const lines = text.split(/\r?\n/);
+    const selected = new Set<number>();
+    lines.forEach((line, index) => {
+      const lower = line.toLowerCase();
+      if (/^\s*(export\s+)?(async\s+)?(function|class|const|interface|type)\s+|^\s*(def|class)\s+/i.test(line)) selected.add(index);
+      if (qTokens.some((token) => lower.includes(token))) {
+        for (let i = Math.max(0, index - 3); i <= Math.min(lines.length - 1, index + 5); i++) selected.add(i);
+      }
+    });
+    const picked = [...selected].sort((a, b) => a - b).slice(0, 140);
+    const body = picked.length
+      ? picked.map((line) => `${line + 1}: ${lines[line]}`).join("\n")
+      : lines.slice(0, 80).map((line, index) => `${index + 1}: ${line}`).join("\n");
+    const rel = full.replace(resolve(root), "").replace(/^[/\\]/, "");
+    const content = `File: ${rel}\n${truncateTokens(body, Math.max(80, Math.floor(tokenBudget / Math.max(files.length, 1))))}`;
+    chunks.push({ file: rel, content, hash: hashString(text), tokens: estimateTokens(content) });
+  }
+  return chunks;
+}
+
+function compressToolOutput(output: string, tokenBudget = 500) {
+  const lines = redactSecrets(String(output || "")).split(/\r?\n/);
+  const keep = lines.filter((line) =>
+    /\b(error|failed|failure|exception|traceback|expected|received|assert|timeout|cannot|denied|not found|stack|at\s+[\w.]+|tests? failed)\b/i.test(line) ||
+    /^\s*(FAIL|ERROR|✘|×|Caused by:)/i.test(line)
+  );
+  const summary = [
+    `Original output: ${lines.length} lines, approx ${estimateTokens(output)} tokens.`,
+    keep.length ? "Important lines:" : "No obvious errors found. Keeping tail.",
+    ...(keep.length ? keep.slice(0, 80) : lines.slice(-40)),
+  ].join("\n");
+  return truncateTokens(summary, tokenBudget);
 }
 
 class LocalMemoryRuntime {
@@ -621,6 +757,84 @@ class LocalMemoryRuntime {
     return { updated, provider: EMBEDDING_PROVIDER };
   }
 
+  async contextPack(input: {
+    project?: string;
+    query: string;
+    cwd?: string;
+    files?: string[];
+    tool_output?: string;
+    previous_context_hash?: string;
+    token_budget?: number;
+    include_memory?: boolean;
+  }) {
+    const project = slugify(input.project || DEFAULT_PROJECT);
+    const budget = Math.min(Math.max(Number(input.token_budget || 1600), 300), 8000);
+    const cwd = resolve(input.cwd || process.cwd());
+    const entries: ContextSnapshot["entries"] = [];
+    let remaining = budget;
+
+    const memoryResults = input.include_memory === false ? [] : await this.search({ project, query: input.query, top_k: 8 });
+    const memoryBlock = memoryResults.map((result) => `- ${result.content}`).join("\n");
+    if (memoryBlock) {
+      const content = `Relevant memory:\n${truncateTokens(memoryBlock, Math.min(remaining, Math.floor(budget * 0.35)))}`;
+      entries.push({ kind: "memory", id: "memory", hash: hashString(content), title: "Relevant memory", content });
+      remaining -= estimateTokens(content);
+    }
+
+    if (input.tool_output) {
+      const content = `Compressed tool output:\n${compressToolOutput(input.tool_output, Math.min(remaining, Math.floor(budget * 0.25)))}`;
+      entries.push({ kind: "tool_output", id: "tool_output", hash: hashString(content), title: "Compressed tool output", content });
+      remaining -= estimateTokens(content);
+    }
+
+    const mapped = codeMap(cwd, input.query, 12);
+    const selectedFiles = Array.from(new Set([...(input.files || []), ...mapped.filter((item) => item.score > 0).slice(0, 6).map((item) => item.file)]));
+    const chunks = packFileChunks(cwd, selectedFiles, input.query, Math.max(120, remaining));
+    for (const chunk of chunks) {
+      if (remaining <= 80) break;
+      const content = truncateTokens(chunk.content, Math.min(chunk.tokens, remaining));
+      entries.push({ kind: "file_chunk", id: chunk.file, hash: chunk.hash, title: chunk.file, content });
+      remaining -= estimateTokens(content);
+    }
+
+    const mapContent = mapped.slice(0, 30).map((item) => `- ${item.file}${item.symbols.length ? `: ${item.symbols.slice(0, 8).join(", ")}` : ""}`).join("\n");
+    if (mapContent && remaining > 100) {
+      const content = `Code map:\n${truncateTokens(mapContent, Math.min(remaining, 300))}`;
+      entries.push({ kind: "code_map", id: "code_map", hash: hashString(content), title: "Code map", content });
+      remaining -= estimateTokens(content);
+    }
+
+    const prior = input.previous_context_hash ? this.data.contextSnapshots.find((item) => item.hash === input.previous_context_hash) : undefined;
+    const priorHashes = new Map((prior?.entries || []).map((entry) => [`${entry.kind}:${entry.id}`, entry.hash]));
+    const changed = entries.filter((entry) => priorHashes.get(`${entry.kind}:${entry.id}`) !== entry.hash);
+    const removed = prior ? prior.entries.filter((entry) => !entries.some((next) => next.kind === entry.kind && next.id === entry.id)).map((entry) => ({ kind: entry.kind, id: entry.id, title: entry.title })) : [];
+    const context = entries.map((entry) => entry.content).join("\n\n---\n\n");
+    const deltaContext = changed.map((entry) => entry.content).join("\n\n---\n\n");
+    const snapshot: ContextSnapshot = {
+      hash: hashString(context),
+      project,
+      query: input.query,
+      entries,
+      created_at: now(),
+    };
+    this.data.contextSnapshots = [snapshot, ...this.data.contextSnapshots.filter((item) => item.hash !== snapshot.hash)].slice(0, 80);
+    this.persist();
+    appendJournal("context.packed", { project, hash: snapshot.hash, previous_context_hash: input.previous_context_hash, entries: entries.length, changed: changed.length, budget });
+    return {
+      context,
+      delta_context: prior ? deltaContext || "No meaningful context changes since the previous pack." : context,
+      context_hash: snapshot.hash,
+      previous_context_hash: input.previous_context_hash || null,
+      token_budget: budget,
+      estimated_tokens: estimateTokens(context),
+      estimated_delta_tokens: estimateTokens(prior ? deltaContext : context),
+      compression_ratio: Number((estimateTokens(context) / Math.max(1, entries.reduce((sum, entry) => sum + estimateTokens(entry.content), 0))).toFixed(4)),
+      changed: changed.map((entry) => ({ kind: entry.kind, id: entry.id, title: entry.title, hash: entry.hash })),
+      removed,
+      entries: entries.map((entry) => ({ kind: entry.kind, id: entry.id, title: entry.title, hash: entry.hash })),
+    };
+  }
+
   snapshot(project?: string) {
     const slug = project ? slugify(project) : undefined;
     const memories = this.data.memories
@@ -763,6 +977,8 @@ function createApp(runtime: LocalMemoryRuntime) {
       context: "POST /v1/context/query",
       memory_write: "POST /v1/memory",
       memory_search: "POST /v1/memory/search",
+      context_pack: "POST /v1/context/pack",
+      context_delta: "POST /v1/context/delta",
       memory_ingest: "POST /v1/memory/ingest/session",
       agent_event: "POST /v1/agent-events",
     },
@@ -814,6 +1030,28 @@ function createApp(runtime: LocalMemoryRuntime) {
         context_hash: createHash("sha256").update(results.map((result) => result.content).join("\n")).digest("hex"),
       },
     });
+  });
+  app.post("/v1/context/pack", async (c) => {
+    const body = await c.req.json().catch(() => ({} as any));
+    return json(c, await runtime.contextPack(body));
+  });
+  app.post("/v1/context/delta", async (c) => {
+    const body = await c.req.json().catch(() => ({} as any));
+    return json(c, await runtime.contextPack({ ...body, previous_context_hash: body.previous_context_hash || body.context_hash }));
+  });
+  app.post("/v1/context/compress-output", async (c) => {
+    const body = await c.req.json().catch(() => ({} as any));
+    const compressed = compressToolOutput(String(body.output || body.tool_output || ""), Number(body.token_budget || 500));
+    return json(c, {
+      compressed,
+      estimated_tokens: estimateTokens(compressed),
+      original_estimated_tokens: estimateTokens(String(body.output || body.tool_output || "")),
+      compression_ratio: Number((estimateTokens(compressed) / Math.max(1, estimateTokens(String(body.output || body.tool_output || "")))).toFixed(4)),
+    });
+  });
+  app.post("/v1/context/code-map", async (c) => {
+    const body = await c.req.json().catch(() => ({} as any));
+    return json(c, { files: codeMap(String(body.cwd || process.cwd()), String(body.query || ""), Number(body.limit || 80)) });
   });
   app.post("/v1/memory/ingest/session", async (c) => {
     const body = await c.req.json();
@@ -1318,6 +1556,36 @@ async function runMcp() {
     session_id: z.string().optional(),
     top_k: z.number().optional(),
   }, async (args: any) => out(await post("/v1/context/query", args)));
+
+  server.tool("context_pack", "Build a small token-budgeted context pack from memory, relevant files, code map, and compressed tool output.", {
+    query: z.string(),
+    cwd: z.string().optional(),
+    files: z.array(z.string()).optional(),
+    tool_output: z.string().optional(),
+    previous_context_hash: z.string().optional(),
+    token_budget: z.number().optional(),
+    include_memory: z.boolean().optional(),
+  }, async (args: any) => out(await post("/v1/context/pack", args)));
+
+  server.tool("context_delta", "Return only what changed since a previous RetainDB context pack.", {
+    query: z.string(),
+    previous_context_hash: z.string(),
+    cwd: z.string().optional(),
+    files: z.array(z.string()).optional(),
+    tool_output: z.string().optional(),
+    token_budget: z.number().optional(),
+  }, async (args: any) => out(await post("/v1/context/delta", args)));
+
+  server.tool("compress_output", "Compress terminal, test, build, or tool output while keeping failures and stack traces.", {
+    output: z.string(),
+    token_budget: z.number().optional(),
+  }, async (args: any) => out(await post("/v1/context/compress-output", args)));
+
+  server.tool("code_map", "Build a compact map of relevant files and symbols for a coding task.", {
+    query: z.string().optional(),
+    cwd: z.string().optional(),
+    limit: z.number().optional(),
+  }, async (args: any) => out(await post("/v1/context/code-map", args)));
 
   server.tool("remember", "Save a durable memory to RetainDB Local.", {
     content: z.string(),
