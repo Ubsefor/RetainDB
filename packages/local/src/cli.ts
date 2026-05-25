@@ -1457,7 +1457,7 @@ function writeConnectSnippets(target = "all") {
     }
   }
   console.log("");
-  console.log("Merge these snippets into the agent config. Start RetainDB Local with `retaindb` first.");
+  console.log("Merge these snippets into the agent config. Start RetainDB Local with `npx -y @retaindb/local` first.");
 }
 
 function backupPath(path: string) {

@@ -1,9 +1,10 @@
 {
   "name": "@retaindb/local",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "RetainDB Local - one-process persistent memory for coding agents",
   "type": "module",
   "bin": {
+    "local": "./dist/cli.js",
     "retaindb": "./dist/cli.js",
     "retaindb-local": "./dist/cli.js"
   },
