@@ -28,6 +28,9 @@ retaindb install-embeddings  # warm the local transformer model cache
 retaindb connect all     # write Codex, Claude Code, and OpenCode snippets
 retaindb connect all --install  # merge Codex/Claude Code user configs with backups
 retaindb hook            # capture a hook payload from stdin
+retaindb files sync      # generate .retaindb/files for multi-agent context
+retaindb files read /README.md
+retaindb files write --kind=handoff --agent=planner --to=builder
 retaindb import-jsonl    # import Claude-style JSONL transcripts
 retaindb consolidate     # dedupe and roll up sessions into semantic/procedural memory
 retaindb reembed         # refresh vectors with the configured embedding provider
@@ -42,8 +45,35 @@ RetainDB Local can reduce normal coding-agent token use, not just memory tokens.
 - `POST /v1/context/delta` returns only what changed since a previous `context_hash`.
 - `POST /v1/context/compress-output` keeps errors, failing tests, and stack traces while dropping log noise.
 - `POST /v1/context/code-map` returns relevant files and symbols without dumping the repo.
+- `GET /v1/filesystem` lists or reads `.retaindb/files` entries.
+- `GET /v1/context/files` is a compatibility alias for agent filesystem reads.
+- `POST /v1/filesystem/sync` regenerates the local brain files.
+- `POST /v1/filesystem/write` writes an agent note or handoff and promotes it into memory.
 
 The bundled MCP bridge exposes `context_pack`, `context_delta`, `compress_output`, and `code_map`.
+
+## Agent Filesystem
+
+RetainDB Local can mirror memory into a repo-local `.retaindb/files/` tree so multiple agents can coordinate through files.
+
+```bash
+retaindb files sync
+retaindb files read /README.md
+echo "Builder should continue the auth cleanup from the failing login test." \
+  | retaindb files write --kind=handoff --agent=planner --to=builder --title="Auth handoff"
+```
+
+Generated files include:
+
+- `/README.md` — current project brain and agent instructions.
+- `/memories/recent.md` — durable recent memory.
+- `/memories/decisions.md` — decisions, constraints, corrections.
+- `/memories/workflows.md` — reusable workflows and procedures.
+- `/sessions/index.md` — session summaries.
+- `/agents/index.md` — agent-scoped memory.
+- `/inbox/*.md` — append-only notes and handoffs written by agents.
+
+The bundled MCP bridge exposes `files_sync`, `files_list`, `files_read`, and `files_write`. `files_write` stores the note as both a markdown file and RetainDB memory, so file-to-file handoffs also show up in recall/search.
 
 Optional local model embeddings:
 

@@ -5,6 +5,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { listBrainFileTree, readBrainFile, syncBrainFilesystem, writeAgentBrainFile } from "./filesystem/index.js";
 
 type Message = { role: string; content: string; timestamp?: string };
 type WorkEvent = {
@@ -979,6 +980,9 @@ function createApp(runtime: LocalMemoryRuntime) {
       memory_search: "POST /v1/memory/search",
       context_pack: "POST /v1/context/pack",
       context_delta: "POST /v1/context/delta",
+      filesystem: "GET /v1/filesystem",
+      filesystem_sync: "POST /v1/filesystem/sync",
+      filesystem_write: "POST /v1/filesystem/write",
       memory_ingest: "POST /v1/memory/ingest/session",
       agent_event: "POST /v1/agent-events",
     },
@@ -1052,6 +1056,60 @@ function createApp(runtime: LocalMemoryRuntime) {
   app.post("/v1/context/code-map", async (c) => {
     const body = await c.req.json().catch(() => ({} as any));
     return json(c, { files: codeMap(String(body.cwd || process.cwd()), String(body.query || ""), Number(body.limit || 80)) });
+  });
+  app.get("/v1/filesystem", (c) => {
+    try {
+      const project = c.req.query("project") || DEFAULT_PROJECT;
+      const cwd = c.req.query("cwd") || process.cwd();
+      const path = c.req.query("path");
+      syncBrainFilesystem({ cwd, project, snapshot: runtime.snapshot(project) });
+      if (path) return json(c, { file: readBrainFile({ cwd, path, includeContents: c.req.query("includeContents") !== "false" }) });
+      return json(c, listBrainFileTree(cwd, c.req.query("includeContents") === "true", Number(c.req.query("limit") || 250)));
+    } catch (error) {
+      return json(c, { error: { code: "FILESYSTEM_ERROR", message: error instanceof Error ? error.message : String(error) } }, 400);
+    }
+  });
+  app.get("/v1/context/files", (c) => {
+    try {
+      const project = c.req.query("project") || DEFAULT_PROJECT;
+      const cwd = c.req.query("cwd") || process.cwd();
+      const path = c.req.query("path");
+      syncBrainFilesystem({ cwd, project, snapshot: runtime.snapshot(project) });
+      if (path) return json(c, { file: readBrainFile({ cwd, path, includeContents: c.req.query("includeContents") !== "false" }) });
+      return json(c, listBrainFileTree(cwd, c.req.query("includeContents") === "true", Number(c.req.query("limit") || 250)));
+    } catch (error) {
+      return json(c, { error: { code: "FILESYSTEM_ERROR", message: error instanceof Error ? error.message : String(error) } }, 400);
+    }
+  });
+  app.post("/v1/filesystem/sync", async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({} as any));
+      const project = String(body.project || DEFAULT_PROJECT);
+      const result = syncBrainFilesystem({ cwd: body.cwd || process.cwd(), project, snapshot: runtime.snapshot(project) });
+      return json(c, result);
+    } catch (error) {
+      return json(c, { error: { code: "FILESYSTEM_SYNC_ERROR", message: error instanceof Error ? error.message : String(error) } }, 400);
+    }
+  });
+  app.post("/v1/filesystem/write", async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({} as any));
+      const written = writeAgentBrainFile({ ...body, cwd: body.cwd || process.cwd(), project: body.project || DEFAULT_PROJECT });
+      const memory = await runtime.addMemory({
+        project: String(body.project || DEFAULT_PROJECT),
+        content: written.memoryContent,
+        memory_type: body.kind === "handoff" ? "session_summary" : body.kind || "project_state",
+        session_id: body.sessionId || body.session_id,
+        agent_id: body.agentId || body.agent_id,
+        task_id: body.taskId || body.task_id,
+        importance: body.kind === "handoff" || body.kind === "decision" ? 0.92 : 0.72,
+        metadata: { source: "local_brain_file", path: written.path, files: body.files || [] },
+      });
+      syncBrainFilesystem({ cwd: body.cwd || process.cwd(), project: String(body.project || DEFAULT_PROJECT), snapshot: runtime.snapshot(body.project || DEFAULT_PROJECT) });
+      return json(c, { written, memory_id: memory.id, stored: memory.active });
+    } catch (error) {
+      return json(c, { error: { code: "FILESYSTEM_WRITE_ERROR", message: error instanceof Error ? error.message : String(error) } }, 400);
+    }
   });
   app.post("/v1/memory/ingest/session", async (c) => {
     const body = await c.req.json();
@@ -1589,6 +1647,55 @@ async function runMcp() {
     limit: z.number().optional(),
   }, async (args: any) => out(await post("/v1/context/code-map", args)));
 
+  server.tool("files_sync", "Generate the repo-local .retaindb/files company brain for multi-agent handoff.", {
+    cwd: z.string().optional(),
+  }, async (args: any) => out(await post("/v1/filesystem/sync", args)));
+
+  server.tool("files_list", "List RetainDB Local brain files under .retaindb/files.", {
+    cwd: z.string().optional(),
+    include_contents: z.boolean().optional(),
+    limit: z.number().optional(),
+  }, async (args: any) => {
+    const params = new URLSearchParams({
+      project,
+      ...(args.cwd ? { cwd: args.cwd } : {}),
+      includeContents: args.include_contents ? "true" : "false",
+      limit: String(args.limit || 250),
+    });
+    return out(await get(`/v1/filesystem?${params.toString()}`));
+  });
+
+  server.tool("files_read", "Read a RetainDB Local brain file such as /README.md or /memories/decisions.md.", {
+    path: z.string(),
+    cwd: z.string().optional(),
+  }, async (args: any) => {
+    const params = new URLSearchParams({
+      project,
+      path: args.path,
+      includeContents: "true",
+      ...(args.cwd ? { cwd: args.cwd } : {}),
+    });
+    return out(await get(`/v1/filesystem?${params.toString()}`));
+  });
+
+  server.tool("files_write", "Write an append-only agent note or handoff into .retaindb/files/inbox and memory.", {
+    content: z.string(),
+    title: z.string().optional(),
+    kind: z.enum(["note", "handoff", "decision", "task", "file_edit", "failure"]).optional(),
+    agent_id: z.string().optional(),
+    to_agent_id: z.string().optional(),
+    session_id: z.string().optional(),
+    task_id: z.string().optional(),
+    files: z.array(z.string()).optional(),
+    cwd: z.string().optional(),
+  }, async (args: any) => out(await post("/v1/filesystem/write", {
+    ...args,
+    agentId: args.agent_id,
+    toAgentId: args.to_agent_id,
+    sessionId: args.session_id,
+    taskId: args.task_id,
+  })));
+
   server.tool("remember", "Save a durable memory to RetainDB Local.", {
     content: z.string(),
     memory_type: z.string().optional(),
@@ -1891,6 +1998,63 @@ async function importJsonl(pathArg?: string) {
   console.log(JSON.stringify({ imported: true, root, files, memories, store: STORE_PATH }, null, 2));
 }
 
+async function runFilesCommand() {
+  const runtime = new LocalMemoryRuntime();
+  const subcommand = process.argv[3] || "sync";
+  const project = arg("project") || process.env.RETAINDB_PROJECT || DEFAULT_PROJECT;
+  const cwd = arg("cwd") || process.cwd();
+  if (subcommand === "sync") {
+    console.log(JSON.stringify(syncBrainFilesystem({ cwd, project, snapshot: runtime.snapshot(project) }), null, 2));
+    return;
+  }
+  if (subcommand === "list") {
+    syncBrainFilesystem({ cwd, project, snapshot: runtime.snapshot(project) });
+    console.log(JSON.stringify(listBrainFileTree(cwd, process.argv.includes("--contents")), null, 2));
+    return;
+  }
+  if (subcommand === "read") {
+    const path = process.argv[4] || arg("path") || "/README.md";
+    syncBrainFilesystem({ cwd, project, snapshot: runtime.snapshot(project) });
+    const file = readBrainFile({ cwd, path, includeContents: true });
+    process.stdout.write(file.content || "");
+    return;
+  }
+  if (subcommand === "write") {
+    let stdin = "";
+    if (!process.stdin.isTTY) {
+      for await (const chunk of process.stdin) stdin += chunk;
+    }
+    const content = arg("content") || stdin.trim();
+    const kind = arg("kind") || "note";
+    const written = writeAgentBrainFile({
+      cwd,
+      project,
+      content,
+      title: arg("title"),
+      kind: kind as any,
+      agentId: arg("agent") || process.env.RETAINDB_AGENT_ID || "agent",
+      toAgentId: arg("to"),
+      sessionId: arg("session") || process.env.RETAINDB_SESSION_ID,
+      taskId: arg("task"),
+      files: (arg("files") || "").split(",").map((item) => item.trim()).filter(Boolean),
+    });
+    const memory = await runtime.addMemory({
+      project,
+      content: written.memoryContent,
+      memory_type: kind === "handoff" ? "session_summary" : kind,
+      agent_id: arg("agent") || process.env.RETAINDB_AGENT_ID || "agent",
+      session_id: arg("session") || process.env.RETAINDB_SESSION_ID,
+      task_id: arg("task"),
+      importance: kind === "handoff" || kind === "decision" ? 0.92 : 0.72,
+      metadata: { source: "local_brain_file", path: written.path },
+    });
+    syncBrainFilesystem({ cwd, project, snapshot: runtime.snapshot(project) });
+    console.log(JSON.stringify({ written, memory_id: memory.id, stored: memory.active }, null, 2));
+    return;
+  }
+  throw new Error("Usage: retaindb files sync|list|read|write");
+}
+
 function startServer() {
   const runtime = new LocalMemoryRuntime();
   const app = createApp(runtime);
@@ -1920,6 +2084,7 @@ async function main() {
     return writeConnectSnippets(target);
   }
   if (command === "hook") return runHook();
+  if (command === "files") return runFilesCommand();
   if (command === "import-jsonl") return importJsonl(process.argv[3]);
   if (command === "consolidate") {
     const runtime = new LocalMemoryRuntime();
@@ -1952,6 +2117,9 @@ async function main() {
   console.log("  retaindb connect all     Write Codex/Claude Code/OpenCode snippets");
   console.log("  retaindb connect all --install  Merge Codex/Claude Code user configs with backups");
   console.log("  retaindb hook            Capture a hook payload from stdin");
+  console.log("  retaindb files sync      Generate .retaindb/files for multi-agent context");
+  console.log("  retaindb files read /README.md");
+  console.log("  retaindb files write --kind=handoff --agent=planner --to=builder");
   console.log("  retaindb import-jsonl    Import Claude-style JSONL transcripts");
   console.log("  retaindb consolidate     Deduplicate and summarize local sessions");
   console.log("  retaindb reembed         Refresh vectors with the configured local embedding provider");
