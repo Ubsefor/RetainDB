@@ -34,7 +34,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/retaindb/retaindb.git"
+    "url": "git+https://github.com/RetainDB/RetainDB.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

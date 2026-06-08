@@ -651,6 +651,185 @@ export class RetainDB {
     return response.data;
   }
 
+  // ── Company brain (sources-aware retrieval) ────────────────────────────
+
+  /** List registered source connectors (web, github, slack, …) with their auth requirements. */
+  async getConnectorDescriptors(): Promise<{
+    connectors: Array<{ type: string; requiresAuth: boolean; description: string }>;
+  }> {
+    const response = await this._client.request<{
+      connectors: Array<{ type: string; requiresAuth: boolean; description: string }>;
+    }>({ endpoint: "/v1/sources/connectors", method: "GET", operation: "list_connectors" });
+    return response.data;
+  }
+
+  async listSources(): Promise<{ sources: Array<Record<string, unknown>> }> {
+    const project = this.project || "default";
+    const response = await this._client.request<{ sources: Array<Record<string, unknown>> }>({
+      endpoint: `/v1/sources?project=${encodeURIComponent(project)}`,
+      method: "GET",
+      operation: "list_sources",
+    });
+    return response.data;
+  }
+
+  async getSource(id: string): Promise<Record<string, unknown>> {
+    const response = await this._client.request<Record<string, unknown>>({
+      endpoint: `/v1/sources/${encodeURIComponent(id)}`,
+      method: "GET",
+      operation: "get_source",
+    });
+    return response.data;
+  }
+
+  async addSource(input: {
+    type: string;
+    name?: string;
+    project?: string;
+    config: Record<string, unknown>;
+  }): Promise<Record<string, unknown>> {
+    const project = input.project || this.project || "default";
+    const response = await this._client.request<Record<string, unknown>>({
+      endpoint: "/v1/sources",
+      method: "POST",
+      operation: "create_source",
+      body: { ...input, project },
+    });
+    return response.data;
+  }
+
+  async updateSource(id: string, patch: { name?: string; config?: Record<string, unknown> }): Promise<Record<string, unknown>> {
+    const response = await this._client.request<Record<string, unknown>>({
+      endpoint: `/v1/sources/${encodeURIComponent(id)}`,
+      method: "PATCH",
+      operation: "update_source",
+      body: patch,
+    });
+    return response.data;
+  }
+
+  async deleteSource(id: string): Promise<{ deleted: boolean; id: string }> {
+    const response = await this._client.request<{ deleted: boolean; id: string }>({
+      endpoint: `/v1/sources/${encodeURIComponent(id)}`,
+      method: "DELETE",
+      operation: "delete_source",
+    });
+    return response.data;
+  }
+
+  /** Run sync for a source — fetches remote content, indexes as memories, returns citations. */
+  async syncSource(id: string): Promise<{
+    source_id: string;
+    result: { documents_indexed: number; memories_created: number; errors: string[]; truncated: boolean; duration_ms: number; citations: Array<{ id: string; title: string }> };
+    citations: Array<{ id: string; title: string }>;
+  }> {
+    const response = await this._client.request<{ source_id: string; result: any; citations: Array<{ id: string; title: string }> }>({
+      endpoint: `/v1/sources/${encodeURIComponent(id)}/sync`,
+      method: "POST",
+      operation: "sync_source",
+    });
+    return response.data;
+  }
+
+  /** Dump the whole company brain for a project, grouped by source. */
+  async companyBrain(opts: { project?: string; maxTokens?: number } = {}): Promise<{
+    project: string;
+    total_memories: number;
+    total_sources: number;
+    sources: Array<Record<string, unknown>>;
+    sources_index: Array<Record<string, unknown>>;
+    text: string;
+    citations: Array<Record<string, unknown>>;
+    generated_at: string;
+  }> {
+    const project = opts.project || this.project || "default";
+    const response = await this._client.request<{
+      project: string;
+      total_memories: number;
+      total_sources: number;
+      sources: Array<Record<string, unknown>>;
+      sources_index: Array<Record<string, unknown>>;
+      text: string;
+      citations: Array<Record<string, unknown>>;
+      generated_at: string;
+    }>({
+      endpoint: `/v1/company-brain?project=${encodeURIComponent(project)}&maxTokens=${encodeURIComponent(String(opts.maxTokens || 8000))}`,
+      method: "GET",
+      operation: "company_brain",
+    });
+    return response.data;
+  }
+
+  /** Search the company brain for a question, returning a context block + citations. */
+  async askBrain(input: {
+    query: string;
+    project?: string;
+    topK?: number;
+    maxTokens?: number;
+    includeAgentMemories?: boolean;
+  }): Promise<{
+    query: string;
+    context: string;
+    citations: Array<Record<string, unknown>>;
+    hits: number;
+    total_tokens: number;
+  }> {
+    const project = input.project || this.project || "default";
+    const response = await this._client.request<{
+      query: string;
+      context: string;
+      citations: Array<Record<string, unknown>>;
+      hits: number;
+      total_tokens: number;
+    }>({
+      endpoint: "/v1/company-brain/ask",
+      method: "POST",
+      operation: "ask_brain",
+      body: {
+        query: input.query,
+        project,
+        top_k: input.topK,
+        max_tokens: input.maxTokens,
+        include_agent_memories: input.includeAgentMemories,
+      },
+    });
+    return response.data;
+  }
+
+  /** Build an LLM-ready system prompt + message list, grounded in the company brain. */
+  async feedAgent(input: {
+    query?: string;
+    messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+    project?: string;
+    maxContextTokens?: number;
+    includeAgentMemories?: boolean;
+  }): Promise<{
+    system_prompt: string;
+    messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+    citations: Array<Record<string, unknown>>;
+    context_tokens: number;
+  }> {
+    const project = input.project || this.project || "default";
+    const response = await this._client.request<{
+      system_prompt: string;
+      messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+      citations: Array<Record<string, unknown>>;
+      context_tokens: number;
+    }>({
+      endpoint: "/v1/company-brain/feed",
+      method: "POST",
+      operation: "feed_agent",
+      body: {
+        query: input.query,
+        messages: input.messages,
+        project,
+        max_context_tokens: input.maxContextTokens,
+        include_agent_memories: input.includeAgentMemories,
+      },
+    });
+    return response.data;
+  }
+
   session(sessionId: string): SessionLearnScope {
     if (!sessionId || !sessionId.trim()) throw new Error("RetainDB: sessionId is required and cannot be empty");
 

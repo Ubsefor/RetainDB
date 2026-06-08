@@ -6,6 +6,12 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renam
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { listBrainFileTree, readBrainFile, syncBrainFilesystem, writeAgentBrainFile } from "./filesystem/index.js";
+import { SourceStore } from "./sources/store.js";
+import { runSourceSync, describeConnectors, newSourceId } from "./sources/sync.js";
+import { ensureConnectorsRegistered } from "./connectors/registry.js";
+import { getConnector, listConnectorDescriptors, listConnectorTypes } from "./connectors/types.js";
+import type { SourceType } from "./sources/types.js";
+import { buildCompanyBrain, askBrain, feedAgent, memoryToCitation, isFromSource } from "./brain/company_brain.js";
 
 type Message = { role: string; content: string; timestamp?: string };
 type WorkEvent = {
@@ -51,12 +57,36 @@ type ContextSnapshot = {
   hash: string;
   project: string;
   query: string;
-  entries: Array<{ kind: string; id: string; hash: string; title: string; content: string }>;
+  entries: Array<{ kind: string; id: string; hash: string; title: string; content: string; citations?: Array<Record<string, unknown>> }>;
   created_at: string;
 };
 type StoreData = { projects: Project[]; memories: Memory[]; shares: Share[]; contextSnapshots: ContextSnapshot[] };
 
 const STOP_WORDS = new Set(["the", "and", "for", "that", "with", "this", "from", "into", "user", "agent", "session", "tool", "used", "uses", "using"]);
+const LOCAL_WRITE_POLICY_VERSION = "local_memory_write_v2";
+const USER_CROSS_SESSION_THRESHOLD = 0.68;
+const PROJECT_SCOPE_THRESHOLD = 0.76;
+const AGENT_SCOPE_THRESHOLD = 0.74;
+const TASK_SCOPE_THRESHOLD = 0.72;
+const SESSION_ONLY_THRESHOLD = 0.58;
+const DURABLE_MEMORY_TYPES = new Set(["factual", "preference", "relationship", "opinion", "goal", "instruction", "decision", "constraint", "solution", "project_state", "correction", "workflow", "session_summary"]);
+const MEMORY_TYPE_WEIGHT: Record<string, number> = {
+  decision: 0.78,
+  constraint: 0.75,
+  preference: 0.72,
+  instruction: 0.68,
+  workflow: 0.7,
+  solution: 0.72,
+  correction: 0.66,
+  relationship: 0.58,
+  opinion: 0.48,
+  goal: 0.62,
+  project_state: 0.56,
+  factual: 0.42,
+  semantic: 0.42,
+  session_summary: 0.45,
+  event: 0.18,
+};
 const RRF_K = 60;
 const LOW_SIGNAL_PATTERNS = [
   /^\s*(ok|okay|thanks|thank you|done|yes|no|hi|hello)\s*[.!?]*\s*$/i,
@@ -118,31 +148,249 @@ function clamp(value: number, min = 0, max = 1) {
 
 function signalQuality(text: string) {
   const trimmed = text.trim();
-  const normalized = trimmed.replace(/^(prompt|message|event|session_start|session_end|tool_result|post_tool_use|pre_tool_use)\s*:\s*/i, "").trim();
+  const normalized = normalizeMemoryText(trimmed);
   if (!trimmed) return 0;
   if (LOW_SIGNAL_PATTERNS.some((pattern) => pattern.test(normalized || trimmed))) return 0.05;
   const tokens = uniqueTokens(normalized || trimmed);
   const hasCodePath = /\b[\w.-]+\/[\w./-]+\b|\b[\w.-]+\.(ts|tsx|js|jsx|py|rs|go|md|json|toml|yaml|yml)\b/i.test(normalized || trimmed);
-  const hasDecision = /\b(decided|prefer|use|avoid|because|constraint|fixed|root cause|regression|todo|next|deploy|test|auth|rate limit|schema|migration)\b/i.test(normalized || trimmed);
-  const hasOutcome = /\b(pass|passed|fail|failed|error|resolved|implemented|created|updated|removed|blocked)\b/i.test(normalized || trimmed);
-  return clamp(0.18 + Math.min(tokens.length, 80) / 120 + (hasCodePath ? 0.2 : 0) + (hasDecision ? 0.25 : 0) + (hasOutcome ? 0.18 : 0));
+  const hasDecision = /\b(decided|decision|prefer|preference|use|avoid|because|constraint|fixed|root cause|regression|todo|next|deploy|test|auth|rate limit|schema|migration|standardize|chosen|picked)\b/i.test(normalized || trimmed);
+  const hasOutcome = /\b(pass|passed|fail|failed|error|resolved|implemented|created|updated|removed|blocked|deprecated|superseded)\b/i.test(normalized || trimmed);
+  const hasStructure = /[:;]|\b(before|after|when|if|then|because|instead|so that)\b/i.test(normalized || trimmed);
+  const noisy = /\b(console\.log|stack trace|node_modules|dist\/|build\/|coverage\/)\b/i.test(normalized || trimmed);
+  return clamp(0.12 + Math.min(tokens.length, 80) / 120 + (hasCodePath ? 0.18 : 0) + (hasDecision ? 0.25 : 0) + (hasOutcome ? 0.18 : 0) + (hasStructure ? 0.08 : 0) - (noisy ? 0.12 : 0));
+}
+
+function normalizeWhitespace(value: string) {
+  return String(value || "").trim().replace(/\s+/g, " ");
+}
+
+function normalizeMemoryText(text: string) {
+  return normalizeWhitespace(text)
+    .replace(/^(prompt|message|event|session_start|session_end|tool_result|post_tool_use|pre_tool_use|user asked|agent responded)\s*:\s*/i, "")
+    .trim();
+}
+
+function normalizeMemoryType(memoryType?: string) {
+  const normalized = String(memoryType || "factual").toLowerCase().trim();
+  const map: Record<string, string> = {
+    factual: "factual",
+    semantic: "factual",
+    fact: "factual",
+    preference: "preference",
+    event: "event",
+    episodic: "event",
+    relationship: "relationship",
+    opinion: "opinion",
+    goal: "goal",
+    instruction: "instruction",
+    procedural: "instruction",
+    decision: "decision",
+    constraint: "constraint",
+    solution: "solution",
+    outcome: "solution",
+    project_state: "project_state",
+    state: "project_state",
+    correction: "correction",
+    failure: "correction",
+    fix: "correction",
+    workflow: "workflow",
+    session_summary: "session_summary",
+    summary: "session_summary",
+  };
+  return map[normalized] || "factual";
+}
+
+function buildMemoryNormalizationFields(content: string) {
+  const normalized = normalizeWhitespace(content);
+  const expanded = normalized.replace(/\bgf\b/gi, "girlfriend").replace(/\bbf\b/gi, "boyfriend");
+  const canonical = expanded
+    .replace(/\bi'm\b/gi, "the user is")
+    .replace(/\bi am\b/gi, "the user is")
+    .replace(/\bi\b/gi, "the user")
+    .replace(/\bme\b/gi, "the user")
+    .replace(/\bmy\b/gi, "the user's")
+    .replace(/\bmine\b/gi, "the user's");
+  const thirdPersonCanonical = expanded
+    .replace(/\bhis\b/gi, "the user's")
+    .replace(/\bher\b/gi, "the user's")
+    .replace(/\btheir\b/gi, "the user's")
+    .replace(/\bhe\b/gi, "the user")
+    .replace(/\bshe\b/gi, "the user")
+    .replace(/\bthey\b/gi, "the user");
+  const firstPersonVariant = canonical
+    .replace(/\bthe user's\b/gi, "my")
+    .replace(/\bthe user is\b/gi, "i am")
+    .replace(/\bthe user\b/gi, "i");
+  const variants = Array.from(new Set([normalized, expanded, canonical, thirdPersonCanonical, firstPersonVariant].map((item) => item.toLowerCase()).filter(Boolean)));
+  return {
+    normalized_content: normalized.toLowerCase(),
+    canonical_content: canonical.toLowerCase(),
+    search_text: variants.join(" | "),
+    search_variants: variants,
+    semantic_status: EMBEDDING_PROVIDER === "hash" ? "ready" : "pending",
+  };
+}
+
+function extractEntityMentions(text: string) {
+  const matches = text.match(/\b[A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,3}\b/g) || [];
+  const tech = text.match(/\b(?:React|Next\.js|TypeScript|JavaScript|Python|Docker|Postgres|pgvector|Redis|Hono|JWT|MCP|Codex|Claude|OpenAI|LangChain|LangGraph|Vercel)\b/gi) || [];
+  return Array.from(new Set([...matches, ...tech].map((item) => normalizeWhitespace(item)).filter((item) => item.length > 1))).slice(0, 24);
+}
+
+function buildValidatorIssues(input: { content: string; memoryType: string; eventDate?: string | null; entityMentions?: string[] }) {
+  const issues: string[] = [];
+  const content = normalizeWhitespace(input.content);
+  if (content.length < 10) issues.push("too_short");
+  if (/^(hi|hello|hey|thanks|thank you|ok|okay|bye)[!.]*$/i.test(content)) issues.push("chatter");
+  if (/^(he|she|they|it)\b/i.test(content)) issues.push("unresolved_pronouns");
+  if (/\b(the company|that project|this thing|the system|something|stuff|things)\b/i.test(content)) issues.push("vague_reference");
+  if (/[.;]\s+\S+/.test(content) || /\b(and|also|plus)\b.+\b(and|also|plus)\b/i.test(content)) issues.push("multi_fact");
+  if (content.split(/\s+/).length < 4) issues.push("low_specificity");
+  if ((input.entityMentions || []).length === 0 && /\b(react|python|typescript|docker|postgres|redis|auth|jwt)\b/i.test(content)) issues.push("weak_grounding");
+  if (normalizeMemoryType(input.memoryType) === "event" && /\b(yesterday|today|last week|last month|next week|soon|recently)\b/i.test(content) && !input.eventDate) issues.push("underspecified_temporal");
+  return Array.from(new Set(issues));
+}
+
+function calibrateWriteConfidence(input: { confidenceRaw: number; memoryType: string; extractionMethod: string; validatorIssues: string[] }) {
+  let calibrated = clamp(input.confidenceRaw, 0, 1);
+  const type = normalizeMemoryType(input.memoryType);
+  if (["preference", "goal", "instruction", "decision", "constraint", "solution", "correction", "workflow"].includes(type)) calibrated += 0.04;
+  if (type === "event") calibrated -= 0.03;
+  const method = input.extractionMethod.toLowerCase();
+  if (method === "manual") calibrated += 0.08;
+  else if (method === "pattern" || method === "bullet") calibrated += 0.06;
+  else if (method === "fallback") calibrated -= 0.04;
+  for (const issue of input.validatorIssues) {
+    if (issue === "too_short") calibrated -= 0.08;
+    if (issue === "chatter") calibrated -= 0.2;
+    if (issue === "unresolved_pronouns") calibrated -= 0.12;
+    if (issue === "vague_reference") calibrated -= 0.1;
+    if (issue === "multi_fact") calibrated -= 0.1;
+    if (issue === "low_specificity") calibrated -= 0.06;
+    if (issue === "weak_grounding") calibrated -= 0.04;
+    if (issue === "underspecified_temporal") calibrated -= 0.08;
+  }
+  return clamp(calibrated, 0, 1);
+}
+
+function inferScopeTarget(confidence: number, input: { memoryType: string; userId?: string; sessionId?: string; agentId?: string; taskId?: string; sourceRole?: string; userConfirmed?: boolean; success?: boolean }) {
+  const type = normalizeMemoryType(input.memoryType);
+  const assistantOnly = input.sourceRole === "assistant" && !input.userConfirmed && !input.success;
+  if (assistantOnly && ["decision", "constraint", "solution", "correction"].includes(type)) {
+    return confidence >= SESSION_ONLY_THRESHOLD && input.sessionId ? "SESSION" : "DROPPED";
+  }
+  if (["preference", "goal", "opinion", "factual"].includes(type) && input.userId && confidence >= USER_CROSS_SESSION_THRESHOLD) return "USER";
+  if (type === "instruction") {
+    if (input.userId && confidence >= USER_CROSS_SESSION_THRESHOLD) return "USER";
+    if (input.agentId && confidence >= AGENT_SCOPE_THRESHOLD) return "AGENT";
+    if (input.taskId && confidence >= TASK_SCOPE_THRESHOLD) return "TASK";
+    if (confidence >= PROJECT_SCOPE_THRESHOLD) return "PROJECT";
+  }
+  if (type === "workflow") {
+    if (input.agentId && confidence >= AGENT_SCOPE_THRESHOLD) return "AGENT";
+    if (input.taskId && confidence >= TASK_SCOPE_THRESHOLD) return "TASK";
+    if (confidence >= PROJECT_SCOPE_THRESHOLD) return "PROJECT";
+  }
+  if (["decision", "constraint", "solution", "project_state", "correction", "relationship"].includes(type)) {
+    if (input.taskId && confidence >= TASK_SCOPE_THRESHOLD) return "TASK";
+    if (confidence >= PROJECT_SCOPE_THRESHOLD) return "PROJECT";
+  }
+  if (confidence >= SESSION_ONLY_THRESHOLD && input.sessionId) return "SESSION";
+  return confidence >= SESSION_ONLY_THRESHOLD ? "PROJECT" : "DROPPED";
 }
 
 function inferMemoryType(content: string, fallback = "factual") {
-  if (/\b(decided|prefer|constraint|avoid|because|should|must)\b/i.test(content)) return "semantic";
-  if (/\b(command|workflow|steps?|run|deploy|release|test|build|install)\b/i.test(content)) return "procedural";
-  if (/\b(error|failed|fix|fixed|root cause|regression|bug)\b/i.test(content)) return "correction";
+  const text = normalizeMemoryText(content);
+  const normalizedFallback = normalizeMemoryType(fallback);
+  if (/\b(error|failed|failing|root cause|regression|bug|deprecated|correct(ed|ion)|supersedes?|wrong|broken)\b/i.test(text)) return "correction";
+  if (/\b(fixed|resolved|solution|solved|accepted fix)\b/i.test(text)) return "solution";
+  if (/\b(prefer|prefers|preference|likes|wants|style|tone)\b/i.test(text)) return "preference";
+  if (/\b(must|must not|should|should not|cannot|can't|avoid|required|requirement|constraint|never|always)\b/i.test(text)) return "constraint";
+  if (/\b(decided|decision|chose|chosen|picked|standardize|standardized|settled on|use\b|uses\b|switch(ed)? to)\b/i.test(text)) return "decision";
+  if (/\b(goal|todo|next step|plan|roadmap|milestone|target|need to|should ship)\b/i.test(text)) return "goal";
+  if (/\b(command|workflow|steps?|run|deploy|release|test|build|install|before|after|procedure|playbook)\b/i.test(text)) return "workflow";
+  if (/\b(always|when asked|format|respond|write|include|omit)\b/i.test(text)) return "instruction";
+  if (/\b(reports to|works with|partner|manager|teammate|customer|vendor|depends on)\b/i.test(text)) return "relationship";
   if (/\bsummary|handoff|session ended\b/i.test(content)) return "session_summary";
-  return fallback;
+  return normalizedFallback;
 }
 
 function durableContent(content: string, type: string) {
-  const lines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  if (type === "semantic" || type === "procedural" || type === "correction") {
-    const useful = lines.filter((line) => signalQuality(line) >= 0.35).slice(0, 10);
+  const lines = content.split(/\r?\n|(?<=[.!?])\s+(?=[A-Z0-9`"'])/).map((line) => normalizeMemoryText(line)).filter(Boolean);
+  if (DURABLE_MEMORY_TYPES.has(type)) {
+    const useful = lines.filter((line) => signalQuality(line) >= 0.32).slice(0, 10);
     return useful.length ? useful.join("\n") : lines.slice(0, 6).join("\n");
   }
   return lines.slice(0, 12).join("\n");
+}
+
+type ExtractedMemoryCandidate = {
+  content: string;
+  memory_type: string;
+  importance: number;
+  confidence: number;
+  reason: string;
+};
+
+function intentTypes(query: string) {
+  const text = query.toLowerCase();
+  const types = new Set<string>();
+  if (/\b(decid|choice|chosen|why|rationale|standard|use|using)\b/.test(text)) types.add("decision");
+  if (/\b(must|should|constraint|requirement|avoid|rule|policy|never|always)\b/.test(text)) types.add("constraint");
+  if (/\b(prefer|preference|style|likes|wants)\b/.test(text)) types.add("preference");
+  if (/\b(how|workflow|steps?|run|command|process|deploy|release|test|build)\b/.test(text)) types.add("procedural");
+  if (/\b(error|bug|fail|failed|fix|regression|root cause|broken)\b/.test(text)) types.add("correction");
+  if (/\b(goal|plan|next|todo|roadmap|milestone|target)\b/.test(text)) types.add("goal");
+  if (/\b(status|state|current|summary|handoff|where were we)\b/.test(text)) types.add("project_state");
+  return types;
+}
+
+function extractionCandidates(content: string, fallbackType = "factual") {
+  const normalized = redactSecrets(content).trim();
+  const rawSegments = normalized
+    .split(/\r?\n|(?<=[.!?])\s+(?=(?:[A-Z0-9`"']|We |The |Use |Avoid |Run |Before |After ))/)
+    .map((part) => normalizeMemoryText(part))
+    .filter(Boolean);
+  const candidates: ExtractedMemoryCandidate[] = [];
+  const seen = new Set<string>();
+  const push = (text: string, reason: string, importanceBoost = 0) => {
+    const clean = normalizeMemoryText(text).replace(/^[-*]\s*/, "");
+    if (clean.length < 18 || clean.length > 900) return;
+    const quality = signalQuality(clean);
+    if (quality < 0.26) return;
+    const memoryType = inferMemoryType(clean, fallbackType);
+    const key = `${memoryType}:${normalizedMemoryKey(clean)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push({
+      content: clean,
+      memory_type: memoryType,
+      importance: clamp(0.55 + quality * 0.32 + (MEMORY_TYPE_WEIGHT[memoryType] || 0.3) * 0.18 + importanceBoost, 0.25, 0.98),
+      confidence: clamp(0.62 + quality * 0.24 + (DURABLE_MEMORY_TYPES.has(memoryType) ? 0.08 : 0), 0.25, 0.97),
+      reason,
+    });
+  };
+
+  for (const segment of rawSegments) {
+    const type = inferMemoryType(segment, fallbackType);
+    const isActionable = DURABLE_MEMORY_TYPES.has(type) || /\b(decided|must|prefer|failed|fixed|run|next|todo|because|instead)\b/i.test(segment);
+    if (isActionable) push(segment, "pattern", type === "correction" || type === "decision" ? 0.06 : 0);
+  }
+
+  const bullets = normalized.match(/(?:^|\n)\s*(?:[-*]|\d+[.)])\s+(.+)/g) || [];
+  for (const bullet of bullets) push(bullet.replace(/^\s*(?:[-*]|\d+[.)])\s+/, ""), "bullet", 0.03);
+
+  if (candidates.length === 0) push(normalized, "fallback", -0.04);
+  return candidates.slice(0, 8);
+}
+
+function jaccardSimilarity(a: string, b: string) {
+  const left = new Set(uniqueTokens(a).filter((token) => !STOP_WORDS.has(token)));
+  const right = new Set(uniqueTokens(b).filter((token) => !STOP_WORDS.has(token)));
+  if (left.size === 0 || right.size === 0) return 0;
+  let intersection = 0;
+  for (const token of left) if (right.has(token)) intersection += 1;
+  return intersection / (left.size + right.size - intersection);
 }
 
 function hashEmbedding(text: string, dims = 96) {
@@ -249,6 +497,21 @@ function writeBenchmarkReport(report: Record<string, unknown>) {
   const path = join(BENCHMARK_DIR, `local-${stamp}.json`);
   writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   return path;
+}
+
+function normalizedMemoryKey(content: string) {
+  return content.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function ageDays(value: string) {
+  return Math.max(0, (Date.now() - Date.parse(value)) / 864e5);
+}
+
+function topEntries(map: Map<string, number>, limit: number) {
+  return [...map.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([name, count]) => ({ name, count }));
 }
 
 function isTextCodeFile(path: string) {
@@ -406,7 +669,8 @@ class LocalMemoryRuntime {
     const inferredType = inferMemoryType(rawText, input.memory_type || "factual");
     const text = durableContent(rawText, inferredType);
     const quality = signalQuality(text);
-    if (quality < 0.12) {
+    const durable = DURABLE_MEMORY_TYPES.has(inferredType);
+    if (quality < (durable ? 0.1 : 0.16)) {
       const timestamp = now();
       return {
         id: `skip_${createHash("sha1").update(`${project}:${timestamp}:${rawText}`).digest("hex").slice(0, 12)}`,
@@ -430,6 +694,27 @@ class LocalMemoryRuntime {
       .digest("hex");
     const duplicate = this.data.memories.find((memory) => memory.metadata?.hash === existingHash && memory.active);
     if (duplicate) return duplicate;
+    const nearDuplicate = this.data.memories.find((memory) =>
+      memory.active &&
+      memory.project === project &&
+      memory.memory_type === inferredType &&
+      (!input.session_id || !memory.session_id || memory.session_id === input.session_id) &&
+      (!input.agent_id || !memory.agent_id || memory.agent_id === input.agent_id) &&
+      jaccardSimilarity(memory.content, text) >= 0.92
+    );
+    if (nearDuplicate) {
+      nearDuplicate.importance = Math.max(nearDuplicate.importance, clamp((input.importance ?? 0.62) + quality * 0.2, 0.1, 0.99));
+      nearDuplicate.confidence = Math.max(nearDuplicate.confidence, clamp((input.confidence ?? 0.78) + quality * 0.1, 0.1, 0.98));
+      nearDuplicate.metadata = {
+        ...nearDuplicate.metadata,
+        merged_count: Number(nearDuplicate.metadata?.merged_count || 1) + 1,
+        last_merged_at: now(),
+      };
+      nearDuplicate.updated_at = now();
+      this.persist();
+      appendJournal("memory.merged", { id: nearDuplicate.id, project, reason: "near_duplicate", similarity: ">=0.92" });
+      return nearDuplicate;
+    }
     const timestamp = now();
     const memory: Memory = {
       id: `mem_${randomUUID()}`,
@@ -440,14 +725,16 @@ class LocalMemoryRuntime {
       session_id: input.session_id,
       agent_id: input.agent_id,
       task_id: input.task_id,
-      importance: clamp((input.importance ?? 0.62) + quality * 0.28 + (inferredType === "semantic" ? 0.08 : inferredType === "procedural" ? 0.06 : 0), 0.1, 0.99),
-      confidence: clamp((input.confidence ?? 0.78) + quality * 0.16, 0.1, 0.98),
+      importance: clamp((input.importance ?? 0.62) + quality * 0.28 + (MEMORY_TYPE_WEIGHT[inferredType] || 0.3) * 0.12, 0.1, 0.99),
+      confidence: clamp((input.confidence ?? 0.78) + quality * 0.16 + (durable ? 0.04 : 0), 0.1, 0.98),
       metadata: {
         ...redactUnknown(input.metadata || {}),
-        concepts: concepts(text),
+        concepts: concepts(`${inferredType} ${text}`),
         hash: existingHash,
         quality,
-        strength: clamp(quality + (input.importance ?? 0.6) / 2),
+        type_weight: MEMORY_TYPE_WEIGHT[inferredType] || 0.3,
+        durable,
+        strength: clamp(quality + (input.importance ?? 0.6) / 2 + (durable ? 0.08 : 0)),
         access_count: 0,
         last_accessed_at: undefined,
         original_type: input.memory_type,
@@ -475,23 +762,33 @@ class LocalMemoryRuntime {
     const memories: Memory[] = [];
     const project = input.project || DEFAULT_PROJECT;
     for (const event of input.events || []) {
+      const fallbackType = event.kind === "failure" ? "correction" : event.kind;
       const content = [
         `${event.kind}: ${event.summary}`,
         event.details ? `Details: ${event.details}` : "",
         event.filePaths?.length ? `Files: ${event.filePaths.join(", ")}` : "",
         event.toolName ? `Tool: ${event.toolName}` : "",
       ].filter(Boolean).join("\n");
-      memories.push(await this.addMemory({
-        project,
-        content,
-        memory_type: event.kind === "failure" ? "correction" : event.kind,
-        user_id: input.user_id,
-        session_id: input.session_id,
-        agent_id: input.agent_id,
-        task_id: input.task_id,
-        importance: event.salience === "high" ? 0.95 : event.salience === "low" ? 0.45 : 0.7,
-        metadata: { source: "agent_event", event },
-      }));
+      const candidates = extractionCandidates(content, fallbackType);
+      for (const candidate of candidates) {
+        memories.push(await this.addMemory({
+          project,
+          content: candidate.content,
+          memory_type: candidate.memory_type,
+          user_id: input.user_id,
+          session_id: input.session_id,
+          agent_id: input.agent_id,
+          task_id: input.task_id,
+          importance: event.salience === "high" ? Math.max(0.86, candidate.importance) : event.salience === "low" ? Math.min(0.58, candidate.importance) : candidate.importance,
+          confidence: candidate.confidence,
+          metadata: {
+            source: "agent_event",
+            extraction_reason: candidate.reason,
+            source_event_kind: event.kind,
+            event,
+          },
+        }));
+      }
     }
     for (const message of input.messages || []) {
       if (message.role === "system" || !message.content?.trim()) continue;
@@ -525,6 +822,7 @@ class LocalMemoryRuntime {
     const project = slugify(input.project || DEFAULT_PROJECT);
     const qTokens = uniqueTokens(input.query);
     const qConcepts = concepts(input.query, 12);
+    const qIntentTypes = intentTypes(input.query);
     const qVector = await embedText(input.query);
     const topK = Math.min(Math.max(input.top_k || 10, 1), 100);
     const candidates = this.data.memories
@@ -536,7 +834,7 @@ class LocalMemoryRuntime {
       .filter((memory) => !input.task_id || memory.task_id === input.task_id || !memory.task_id);
     const docs = candidates.map((memory) => ({
       memory,
-      tokens: tokenize(`${memory.content} ${memory.memory_type} ${JSON.stringify(memory.metadata)}`),
+      tokens: tokenize(`${memory.content} ${memory.memory_type} ${memory.memory_type} ${(Array.isArray(memory.metadata?.concepts) ? memory.metadata.concepts.join(" ") : "")} ${JSON.stringify(memory.metadata)}`),
     }));
     const avgDocLength = docs.reduce((sum, doc) => sum + doc.tokens.length, 0) / Math.max(docs.length, 1);
     const docFreq = new Map<string, number>();
@@ -567,18 +865,26 @@ class LocalMemoryRuntime {
           : concepts(memory.memory.content);
         const conceptOverlap = qConcepts.filter((concept) => memoryConcepts.includes(concept)).length;
         const graph = conceptOverlap + this.relatedConceptBoost(project, qConcepts, memoryConcepts);
+        const memoryType = memory.memory.memory_type;
+        const typeIntent =
+          qIntentTypes.has(memoryType) ? 0.9 :
+          memoryType === "semantic" && [...qIntentTypes].some((type) => ["decision", "constraint", "preference"].includes(type)) ? 0.28 :
+          qIntentTypes.size === 0 && DURABLE_MEMORY_TYPES.has(memoryType) ? 0.12 :
+          0;
         const ageHours = Math.max(1, (Date.now() - Date.parse(memory.memory.created_at)) / 36e5);
         const recency = 1 / Math.sqrt(ageHours);
         const lastAccess = typeof memory.memory.metadata.last_accessed_at === "string" ? Date.parse(memory.memory.metadata.last_accessed_at) : 0;
         const accessAgeHours = lastAccess ? Math.max(1, (Date.now() - lastAccess) / 36e5) : ageHours;
         const accessCount = Number(memory.memory.metadata.access_count || 0);
         const strength = Number(memory.memory.metadata.strength || memory.memory.importance || 0.5);
-        const durability = memory.memory.memory_type === "semantic" ? 0.7 : memory.memory.memory_type === "procedural" ? 0.6 : memory.memory.memory_type === "correction" ? 0.5 : memory.memory.memory_type === "session_summary" ? 0.35 : 0;
+        const durability = MEMORY_TYPE_WEIGHT[memoryType] || 0;
+        const quality = Number(memory.memory.metadata.quality || signalQuality(memory.memory.content));
+        const sourceAuthority = memory.memory.metadata?.source_id || memory.memory.metadata?.citation ? 0.08 : 0;
         const decay = clamp(strength / Math.sqrt(ageHours / 24), 0, 1);
         const reinforcement = Math.log1p(accessCount) / 5 + (lastAccess ? 1 / Math.sqrt(accessAgeHours) / 5 : 0);
-        return { memory: memory.memory, bm25: bm25 + phrase, vector, graph, recency, decay, durability, reinforcement };
+        return { memory: memory.memory, bm25: bm25 + phrase, vector, graph, recency, decay, durability, reinforcement, typeIntent, quality, sourceAuthority };
       })
-      .filter((item) => item.bm25 > 0 || item.vector > 0.05 || item.graph > 0);
+      .filter((item) => item.bm25 > 0 || item.vector > 0.05 || item.graph > 0 || item.typeIntent > 0);
     const rank = (key: "bm25" | "vector" | "graph") => {
       const map = new Map<string, number>();
       [...branchScores].sort((a, b) => b[key] - a[key]).forEach((item, index) => {
@@ -595,7 +901,7 @@ class LocalMemoryRuntime {
           (bm25Rank.has(item.memory.id) ? 1 / (RRF_K + bm25Rank.get(item.memory.id)!) : 0) +
           (vectorRank.has(item.memory.id) ? 1 / (RRF_K + vectorRank.get(item.memory.id)!) : 0) +
           (graphRank.has(item.memory.id) ? 1 / (RRF_K + graphRank.get(item.memory.id)!) : 0);
-        const score = rrf * 100 + item.memory.importance + item.memory.confidence + item.recency + item.decay + item.durability + item.reinforcement;
+        const score = rrf * 100 + item.memory.importance + item.memory.confidence + item.recency + item.decay + item.durability + item.reinforcement + item.typeIntent + item.quality * 0.28 + item.sourceAuthority;
         return { ...item, score };
       })
       .sort((a, b) => b.score - a.score))
@@ -617,12 +923,19 @@ class LocalMemoryRuntime {
       document: item.memory.session_id || item.memory.project,
       type: item.memory.memory_type,
       retrieval_source: "local_rrf",
-      scores: { bm25: Number(item.bm25.toFixed(4)), vector: Number(item.vector.toFixed(4)), graph: Number(item.graph.toFixed(4)) },
+      scores: {
+        bm25: Number(item.bm25.toFixed(4)),
+        vector: Number(item.vector.toFixed(4)),
+        graph: Number(item.graph.toFixed(4)),
+        type_intent: Number(item.typeIntent.toFixed(4)),
+        quality: Number(item.quality.toFixed(4)),
+      },
     }));
   }
 
-  rerank<T extends { memory: Memory; score: number; bm25: number; vector: number; graph: number }>(query: string, items: T[]) {
+  rerank<T extends { memory: Memory; score: number; bm25: number; vector: number; graph: number; typeIntent?: number; quality?: number }>(query: string, items: T[]) {
     const qTokens = uniqueTokens(query).filter((token) => !STOP_WORDS.has(token));
+    const qIntentTypes = intentTypes(query);
     return items
       .map((item) => {
         const content = item.memory.content.toLowerCase();
@@ -632,9 +945,10 @@ class LocalMemoryRuntime {
           .sort((a, b) => a - b)[0];
         const proximity = firstHit === undefined ? 0 : 1 / (1 + firstHit / 200);
         const exact = content.includes(query.toLowerCase()) ? 2 : 0;
-        const lifecycle = item.memory.memory_type === "semantic" || item.memory.memory_type === "procedural" || item.memory.memory_type === "session_summary" ? 0.6 : 0;
+        const lifecycle = DURABLE_MEMORY_TYPES.has(item.memory.memory_type) ? 0.6 : 0;
+        const intent = qIntentTypes.has(item.memory.memory_type) ? 0.7 : 0;
         const evidence = Math.min(1, String(item.memory.metadata?.source_memory_ids || "").split(",").filter(Boolean).length / 8);
-        const rerank_score = item.score + exact + proximity + lifecycle + evidence;
+        const rerank_score = item.score + exact + proximity + lifecycle + intent + evidence + Number(item.quality || 0) * 0.15;
         return { ...item, score: rerank_score };
       })
       .sort((a, b) => b.score - a.score);
@@ -744,6 +1058,152 @@ class LocalMemoryRuntime {
     };
   }
 
+  inspect(project?: string) {
+    const slug = project ? slugify(project) : undefined;
+    const memories = this.data.memories.filter((memory) => !slug || memory.project === slug);
+    const active = memories.filter((memory) => memory.active);
+    const inactive = memories.filter((memory) => !memory.active);
+    const typeCounts = new Map<string, number>();
+    const sourceCounts = new Map<string, number>();
+    const conceptCounts = new Map<string, number>();
+    const duplicateGroups = new Map<string, Memory[]>();
+
+    for (const memory of active) {
+      typeCounts.set(memory.memory_type, (typeCounts.get(memory.memory_type) || 0) + 1);
+      const source = String(memory.metadata?.source || memory.metadata?.source_type || "manual");
+      sourceCounts.set(source, (sourceCounts.get(source) || 0) + 1);
+      const cs = Array.isArray(memory.metadata?.concepts) ? memory.metadata.concepts.map(String) : concepts(memory.content);
+      for (const concept of cs.slice(0, 8)) conceptCounts.set(concept, (conceptCounts.get(concept) || 0) + 1);
+      const key = normalizedMemoryKey(memory.content);
+      duplicateGroups.set(key, [...(duplicateGroups.get(key) || []), memory]);
+    }
+
+    const weakMemories = active
+      .filter((memory) => !DURABLE_MEMORY_TYPES.has(memory.memory_type))
+      .filter((memory) => Number(memory.metadata?.quality || 0) < 0.35)
+      .sort((a, b) => Number(a.metadata?.quality || 0) - Number(b.metadata?.quality || 0))
+      .slice(0, 12);
+
+    const staleMemories = active
+      .filter((memory) => !DURABLE_MEMORY_TYPES.has(memory.memory_type))
+      .filter((memory) => ageDays(memory.created_at) > 7)
+      .filter((memory) => Number(memory.metadata?.access_count || 0) === 0)
+      .filter((memory) => Number(memory.metadata?.strength || memory.importance || 0) < 0.55)
+      .sort((a, b) => ageDays(b.created_at) - ageDays(a.created_at))
+      .slice(0, 12);
+
+    const duplicateCandidates = [...duplicateGroups.values()]
+      .filter((group) => group.length > 1)
+      .sort((a, b) => b.length - a.length)
+      .slice(0, 8)
+      .map((group) => ({
+        count: group.length,
+        ids: group.map((memory) => memory.id),
+        sample: group[0]?.content.slice(0, 220) || "",
+      }));
+
+    const reusable = active
+      .filter((memory) => DURABLE_MEMORY_TYPES.has(memory.memory_type))
+      .sort((a, b) => b.importance + b.confidence - (a.importance + a.confidence))
+      .slice(0, 10)
+      .map((memory) => ({
+        id: memory.id,
+        type: memory.memory_type,
+        content: memory.content,
+        importance: memory.importance,
+        confidence: memory.confidence,
+        access_count: Number(memory.metadata?.access_count || 0),
+      }));
+
+    const topReused = active
+      .filter((memory) => Number(memory.metadata?.access_count || 0) > 0)
+      .sort((a, b) => Number(b.metadata?.access_count || 0) - Number(a.metadata?.access_count || 0))
+      .slice(0, 10)
+      .map((memory) => ({
+        id: memory.id,
+        type: memory.memory_type,
+        content: memory.content,
+        access_count: Number(memory.metadata?.access_count || 0),
+        last_accessed_at: memory.metadata?.last_accessed_at || null,
+      }));
+
+    const sessions = new Set(active.map((memory) => memory.session_id).filter(Boolean));
+    const projects = new Set(active.map((memory) => memory.project));
+    const durableCount = active.filter((memory) => DURABLE_MEMORY_TYPES.has(memory.memory_type)).length;
+    const recalledCount = active.filter((memory) => Number(memory.metadata?.access_count || 0) > 0).length;
+    const avgQuality = active.length
+      ? active.reduce((sum, memory) => sum + Number(memory.metadata?.quality || signalQuality(memory.content)), 0) / active.length
+      : 0;
+    const durableRatio = active.length ? durableCount / active.length : 0;
+    const weakRatio = active.length ? weakMemories.length / active.length : 0;
+    const staleRatio = active.length ? staleMemories.length / active.length : 0;
+    const duplicateRatio = active.length ? duplicateCandidates.reduce((sum, group) => sum + group.count, 0) / active.length : 0;
+    const recallRatio = active.length ? recalledCount / active.length : 0;
+
+    const score = Math.round(clamp(
+      45 +
+      avgQuality * 18 +
+      durableRatio * 18 +
+      Math.min(recallRatio, 0.35) * 18 +
+      Math.min(sessions.size / 8, 1) * 8 -
+      weakRatio * 22 -
+      staleRatio * 16 -
+      duplicateRatio * 12,
+      active.length ? 1 : 0,
+      100,
+    ));
+
+    const recommendations: string[] = [];
+    if (active.length === 0) recommendations.push("Run `retaindb connect all --install`, use your agent normally, then rerun `retaindb inspect`.");
+    if (durableRatio < 0.25 && active.length >= 8) recommendations.push("Run `retaindb consolidate` to promote raw events into semantic, procedural, correction, and session-summary memory.");
+    if (weakMemories.length > 0) recommendations.push("Low-signal memories are present; consolidation can decay old weak observations and keep recall clean.");
+    if (staleMemories.length > 0) recommendations.push("Stale unrecalled memories are building up; run `retaindb consolidate` or delete irrelevant memories from the viewer.");
+    if (duplicateCandidates.length > 0) recommendations.push("Duplicate memory groups found; run `retaindb consolidate` to deactivate repeated entries.");
+    if (topReused.length === 0 && active.length >= 5) recommendations.push("No memories have been reused yet; ask your agent to call RetainDB context tools before coding tasks.");
+    if (conceptCounts.size < 5 && active.length >= 10) recommendations.push("Memory concepts are narrow; ingest broader project docs or connect sources to improve context coverage.");
+    if (recommendations.length === 0) recommendations.push("Memory hygiene looks healthy. Keep using context packs and run `retaindb inspect` after heavier sessions.");
+
+    return {
+      project: slug || "all",
+      score,
+      summary: {
+        active_memories: active.length,
+        inactive_memories: inactive.length,
+        durable_memories: durableCount,
+        sessions: sessions.size,
+        projects: projects.size,
+        recalled_memories: recalledCount,
+        average_quality: Number(avgQuality.toFixed(3)),
+        durable_ratio: Number(durableRatio.toFixed(3)),
+        recall_ratio: Number(recallRatio.toFixed(3)),
+      },
+      counts: {
+        by_type: Object.fromEntries([...typeCounts.entries()].sort((a, b) => b[1] - a[1])),
+        by_source: Object.fromEntries([...sourceCounts.entries()].sort((a, b) => b[1] - a[1])),
+      },
+      top_concepts: topEntries(conceptCounts, 15),
+      reusable,
+      top_reused: topReused,
+      risks: {
+        weak_memories: weakMemories.map((memory) => ({
+          id: memory.id,
+          type: memory.memory_type,
+          quality: Number(memory.metadata?.quality || 0),
+          content: memory.content.slice(0, 220),
+        })),
+        stale_memories: staleMemories.map((memory) => ({
+          id: memory.id,
+          type: memory.memory_type,
+          age_days: Number(ageDays(memory.created_at).toFixed(1)),
+          strength: Number(memory.metadata?.strength || memory.importance || 0),
+          content: memory.content.slice(0, 220),
+        })),
+        duplicate_candidates: duplicateCandidates,
+      },
+      recommendations,
+    };
+  }
+
   async reembed(project?: string) {
     const slug = project ? slugify(project) : undefined;
     let updated = 0;
@@ -767,6 +1227,7 @@ class LocalMemoryRuntime {
     previous_context_hash?: string;
     token_budget?: number;
     include_memory?: boolean;
+    include_company_brain?: boolean;
   }) {
     const project = slugify(input.project || DEFAULT_PROJECT);
     const budget = Math.min(Math.max(Number(input.token_budget || 1600), 300), 8000);
@@ -780,6 +1241,33 @@ class LocalMemoryRuntime {
       const content = `Relevant memory:\n${truncateTokens(memoryBlock, Math.min(remaining, Math.floor(budget * 0.35)))}`;
       entries.push({ kind: "memory", id: "memory", hash: hashString(content), title: "Relevant memory", content });
       remaining -= estimateTokens(content);
+    }
+
+    if (input.include_company_brain !== false) {
+      const sourceHits = memoryResults
+        .map((r: any) => ({
+          ...r.memory,
+          source_id: r.memory.metadata?.source_id,
+          source_type: r.memory.metadata?.source_type,
+          source_title: r.memory.metadata?.source_title,
+          external_id: r.memory.metadata?.external_id,
+          url: r.memory.metadata?.url,
+          citation: r.memory.metadata?.citation,
+        }))
+        .filter((m: any) => isFromSource(m));
+      if (sourceHits.length > 0) {
+        const brain = buildCompanyBrain({
+          project,
+          memories: sourceHits,
+          maxTokens: Math.min(remaining, Math.floor(budget * 0.4)),
+        });
+        if (brain.sources.length > 0) {
+          const header = `Company brain (${brain.total_sources} sources, ${brain.total_memories} memos):`;
+          const content = `${header}\n${truncateTokens(brain.text, Math.max(0, remaining - 20))}`;
+          entries.push({ kind: "company_brain", id: "company_brain", hash: hashString(content), title: "Company brain", content, citations: brain.citations as unknown as Array<Record<string, unknown>> });
+          remaining -= estimateTokens(content);
+        }
+      }
     }
 
     if (input.tool_output) {
@@ -832,7 +1320,15 @@ class LocalMemoryRuntime {
       compression_ratio: Number((estimateTokens(context) / Math.max(1, entries.reduce((sum, entry) => sum + estimateTokens(entry.content), 0))).toFixed(4)),
       changed: changed.map((entry) => ({ kind: entry.kind, id: entry.id, title: entry.title, hash: entry.hash })),
       removed,
-      entries: entries.map((entry) => ({ kind: entry.kind, id: entry.id, title: entry.title, hash: entry.hash })),
+      entries: entries.map((entry) => ({
+        kind: entry.kind,
+        id: entry.id,
+        title: entry.title,
+        hash: entry.hash,
+        ...(entry.citations && entry.citations.length > 0
+          ? { citations: entry.citations, citation_count: entry.citations.length }
+          : {}),
+      })),
     };
   }
 
@@ -948,7 +1444,7 @@ class LocalMemoryRuntime {
       const ageDays = Math.max(0, (Date.now() - Date.parse(memory.created_at)) / 864e5);
       const strength = Number(memory.metadata.strength || memory.importance || 0.5);
       const accessCount = Number(memory.metadata.access_count || 0);
-      const durable = ["semantic", "procedural", "correction", "session_summary"].includes(memory.memory_type);
+      const durable = DURABLE_MEMORY_TYPES.has(memory.memory_type);
       if (!durable && ageDays > 14 && accessCount === 0 && strength < 0.45) {
         memory.active = false;
         memory.updated_at = now();
@@ -968,7 +1464,9 @@ function json(c: any, payload: Record<string, unknown>, status = 200) {
 }
 
 function createApp(runtime: LocalMemoryRuntime) {
+  ensureConnectorsRegistered();
   const app = new Hono();
+  const sources = new SourceStore(RETAINDB_HOME);
   app.get("/", (c) => json(c, {
     name: "RetainDB Local",
     version: "0.1.0",
@@ -980,16 +1478,28 @@ function createApp(runtime: LocalMemoryRuntime) {
       memory_search: "POST /v1/memory/search",
       context_pack: "POST /v1/context/pack",
       context_delta: "POST /v1/context/delta",
+      inspect: "GET /retaindb/inspect",
       filesystem: "GET /v1/filesystem",
       filesystem_sync: "POST /v1/filesystem/sync",
       filesystem_write: "POST /v1/filesystem/write",
       memory_ingest: "POST /v1/memory/ingest/session",
       agent_event: "POST /v1/agent-events",
+      sources: "GET /v1/sources",
+      source_create: "POST /v1/sources",
+      source_get: "GET /v1/sources/:id",
+      source_patch: "PATCH /v1/sources/:id",
+      source_delete: "DELETE /v1/sources/:id",
+      source_sync: "POST /v1/sources/:id/sync",
+      source_descriptors: "GET /v1/sources/connectors",
+      company_brain: "GET /v1/company-brain",
+      company_brain_ask: "POST /v1/company-brain/ask",
+      company_brain_feed: "POST /v1/company-brain/feed",
     },
   }));
   app.get("/health", (c) => json(c, { status: "ok", local: true, stats: runtime.stats() }));
   app.get("/retaindb/health", (c) => json(c, { status: "ok", local: true, stats: runtime.stats() }));
   app.get("/retaindb/snapshot", (c) => json(c, runtime.snapshot(c.req.query("project"))));
+  app.get("/retaindb/inspect", (c) => json(c, runtime.inspect(c.req.query("project"))));
   app.get("/retaindb/graph", (c) => json(c, runtime.graph(c.req.query("project"))));
   app.get("/retaindb/replay/:sessionId", (c) => json(c, runtime.replay(c.req.param("sessionId"), c.req.query("project"))));
   app.post("/retaindb/consolidate", async (c) => {
@@ -1001,6 +1511,158 @@ function createApp(runtime: LocalMemoryRuntime) {
     const body = await c.req.json().catch(() => ({} as any));
     const project = runtime.ensureProject(body.name || body.slug || DEFAULT_PROJECT);
     return json(c, project);
+  });
+  app.get("/v1/sources/connectors", (c) => json(c, { connectors: listConnectorDescriptors() }));
+  app.get("/v1/sources", (c) => {
+    const project = c.req.query("project");
+    return json(c, { sources: sources.list(project) });
+  });
+  app.get("/v1/sources/:id", (c) => {
+    const src = sources.get(c.req.param("id"));
+    if (!src) return json(c, { error: "not_found" }, 404);
+    return json(c, src as unknown as Record<string, unknown>);
+  });
+  app.post("/v1/sources", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as any;
+    const type = body.type as SourceType;
+    if (!type) return json(c, { error: "type_required" }, 400);
+    if (!listConnectorTypes().includes(type)) {
+      return json(c, { error: `unknown_source_type: ${type}` }, 400);
+    }
+    const provider = getConnector(type);
+    const validation = provider?.validateConfig(body.config || {});
+    if (validation && !validation.ok) {
+      return json(c, { error: "invalid_config", detail: validation.error }, 400);
+    }
+    const source = sources.create({
+      type,
+      name: String(body.name || `${type}-${newSourceId().slice(4, 10)}`),
+      project: String(body.project || DEFAULT_PROJECT),
+      config: body.config || {},
+    });
+    runtime.ensureProject(source.project);
+    return json(c, source as unknown as Record<string, unknown>, 201);
+  });
+  app.patch("/v1/sources/:id", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as any;
+    const updated = sources.update(c.req.param("id"), {
+      ...(body.name !== undefined ? { name: String(body.name) } : {}),
+      ...(body.config !== undefined ? { config: body.config } : {}),
+      ...(body.status !== undefined ? { status: body.status } : {}),
+    });
+    if (!updated) return json(c, { error: "not_found" }, 404);
+    if (body.config) {
+      const provider = getConnector(updated.type);
+      const validation = provider?.validateConfig(updated.config);
+      if (validation && !validation.ok) {
+        sources.update(updated.id, updated);
+        return json(c, { error: "invalid_config", detail: validation.error }, 400);
+      }
+    }
+    return json(c, updated as unknown as Record<string, unknown>);
+  });
+  app.delete("/v1/sources/:id", (c) => {
+    const id = c.req.param("id");
+    const ok = sources.delete(id);
+    if (!ok) return json(c, { error: "not_found" }, 404);
+    return json(c, { deleted: true, id });
+  });
+  app.post("/v1/sources/:id/sync", async (c) => {
+    const id = c.req.param("id");
+    const source = sources.get(id);
+    if (!source) return json(c, { error: "not_found" }, 404);
+    sources.update(id, { status: "syncing", last_error: undefined });
+    try {
+      const result = await runSourceSync({
+        source,
+        ingest: (input) =>
+          runtime.addMemory({
+            project: source.project,
+            content: input.content,
+            memory_type: input.memory_type,
+            importance: input.importance,
+            confidence: input.confidence,
+            agent_id: input.agent_id,
+            session_id: input.session_id,
+            metadata: input.metadata,
+          }),
+      });
+      const summary = {
+        documents_indexed: result.documents_indexed,
+        memories_created: result.memories_created,
+        errors: result.errors.length,
+        duration_ms: result.duration_ms,
+      };
+      sources.update(id, {
+        status: result.errors.length > 0 && result.memories_created === 0 ? "error" : "connected",
+        last_synced_at: new Date().toISOString(),
+        last_sync_status: result.errors.length > 0 ? (result.memories_created > 0 ? "partial" : "error") : "ok",
+        last_sync_summary: summary,
+        last_error: result.errors.length > 0 ? result.errors.slice(0, 3).join(" | ") : undefined,
+      });
+      return json(c, { source_id: id, result, citations: result.citations });
+    } catch (err: any) {
+      sources.update(id, { status: "error", last_error: err?.message || String(err) });
+      return json(c, { error: "sync_failed", detail: err?.message || String(err) }, 500);
+    }
+  });
+  app.get("/v1/company-brain", (c) => {
+    const project = slugify(c.req.query("project") || DEFAULT_PROJECT);
+    const maxTokens = Number(c.req.query("maxTokens") || 8000);
+    const memories = (runtime as any).data.memories
+      .filter((m: any) => m.project === project && m.active)
+      .map((m: any) => ({ ...m, source_id: m.metadata?.source_id, source_type: m.metadata?.source_type, source_title: m.metadata?.source_title, external_id: m.metadata?.external_id, url: m.metadata?.url, citation: m.metadata?.citation }));
+    const brain = buildCompanyBrain({ project, memories, maxTokens });
+    return json(c, brain as unknown as Record<string, unknown>);
+  });
+  app.post("/v1/company-brain/ask", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as any;
+    const project = slugify(body.project || DEFAULT_PROJECT);
+    if (!body.query) return json(c, { error: "query_required" }, 400);
+    const topK = Math.min(Math.max(Number(body.top_k || 12), 1), 60);
+    const maxTokens = Math.min(Math.max(Number(body.max_tokens || 2400), 200), 8000);
+    const includeAgent = body.include_agent_memories !== false;
+    const result = await askBrain({
+      project,
+      query: String(body.query),
+      top_k: topK,
+      maxTokens,
+      includeAgentMemories: includeAgent,
+      search: async (input) => {
+        const results = await runtime.search(input);
+        return results.map((r: any) => ({
+          memory: { ...r.memory, source_id: r.memory.metadata?.source_id, source_type: r.memory.metadata?.source_type, source_title: r.memory.metadata?.source_title, external_id: r.memory.metadata?.external_id, url: r.memory.metadata?.url, citation: r.memory.metadata?.citation },
+          score: r.score,
+        }));
+      },
+    });
+    return json(c, result as unknown as Record<string, unknown>);
+  });
+  app.post("/v1/company-brain/feed", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as any;
+    const project = slugify(body.project || DEFAULT_PROJECT);
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const includeAgent = body.include_agent_memories !== false;
+    const maxCtx = Math.min(Math.max(Number(body.max_context_tokens || 2400), 200), 8000);
+    let ask;
+    if (body.query) {
+      ask = await askBrain({
+        project,
+        query: String(body.query),
+        top_k: Number(body.top_k || 12),
+        maxTokens: maxCtx,
+        includeAgentMemories: includeAgent,
+        search: async (input) => {
+          const results = await runtime.search(input);
+          return results.map((r: any) => ({
+            memory: { ...r.memory, source_id: r.memory.metadata?.source_id, source_type: r.memory.metadata?.source_type, source_title: r.memory.metadata?.source_title, external_id: r.memory.metadata?.external_id, url: r.memory.metadata?.url, citation: r.memory.metadata?.citation },
+            score: r.score,
+          }));
+        },
+      });
+    }
+    const out = feedAgent({ project, messages, query: body.query, maxContextTokens: maxCtx, includeAgentMemories: includeAgent, ask });
+    return json(c, out as unknown as Record<string, unknown>);
   });
   app.post("/v1/memory", async (c) => {
     const body = await c.req.json();
@@ -1388,7 +2050,16 @@ function createViewerApp(apiPort: number) {
 
 function arg(name: string) {
   const prefix = `--${name}=`;
-  return process.argv.find((item) => item.startsWith(prefix))?.slice(prefix.length);
+  for (let i = 2; i < process.argv.length; i++) {
+    const a = process.argv[i];
+    if (a === `--${name}`) {
+      const next = process.argv[i + 1];
+      if (next !== undefined && !next.startsWith("--")) return next;
+      return "true";
+    }
+    if (a.startsWith(prefix)) return a.slice(prefix.length);
+  }
+  return undefined;
 }
 
 function mcpEnv(baseUrl: string, project: string) {
@@ -1586,6 +2257,36 @@ function installClaudeConfig(baseUrl: string, project: string) {
   return `${path}, ${settingsPath}`;
 }
 
+function findOpenCodeConfigPath(): string {
+  const xdg = process.env.XDG_CONFIG_HOME;
+  if (xdg) return join(xdg, "opencode", "opencode.json");
+  if (process.platform === "win32" && process.env.APPDATA) {
+    return join(process.env.APPDATA, "opencode", "opencode.json");
+  }
+  return join(homedir(), ".config", "opencode", "opencode.json");
+}
+
+function installOpenCodeConfig(baseUrl: string, project: string): string {
+  // First write the plugin file
+  const outputRoot = process.env.INIT_CWD || process.cwd();
+  const pluginDir = join(outputRoot, ".retaindb", "opencode");
+  mkdirSync(pluginDir, { recursive: true });
+  const pluginDest = join(pluginDir, "retaindb-capture.ts");
+  writeFileSync(pluginDest, opencodePluginSource(baseUrl, project), "utf8");
+  // Now register the plugin in opencode.json
+  const configPath = findOpenCodeConfigPath();
+  mkdirSync(dirname(configPath), { recursive: true });
+  const current = readJsonFile(configPath);
+  const plugins = (current.plugins || []) as unknown[];
+  const pluginRef = pluginDest;
+  if (!plugins.some((p) => String(p).includes("retaindb-capture"))) {
+    plugins.push(pluginRef);
+  }
+  current.plugins = plugins;
+  writeJsonFile(configPath, current);
+  return `${configPath} (+ ${pluginDest})`;
+}
+
 async function runMcp() {
   const [{ McpServer }, { StdioServerTransport }, zod] = await Promise.all([
     import("@modelcontextprotocol/sdk/server/mcp.js"),
@@ -1736,12 +2437,12 @@ async function runMcp() {
 function installUserConfigs(target = "all") {
   const baseUrl = process.env.RETAINDB_BASE_URL || `http://localhost:${DEFAULT_PORT}`;
   const project = process.env.RETAINDB_PROJECT || DEFAULT_PROJECT;
-  const targets = target === "all" ? ["codex", "claude-code"] : [target];
+  const targets = target === "all" ? ["codex", "claude-code", "opencode"] : [target];
   const installed: string[] = [];
   for (const item of targets) {
     if (item === "codex") installed.push(installCodexConfig(baseUrl, project));
     if (item === "claude-code") installed.push(installClaudeConfig(baseUrl, project));
-    if (item === "opencode") writeConnectSnippets("opencode");
+    if (item === "opencode") installed.push(installOpenCodeConfig(baseUrl, project));
   }
   console.log(JSON.stringify({ installed, note: "Backups were written next to changed config files." }, null, 2));
 }
@@ -1818,26 +2519,122 @@ async function runHook() {
 }
 
 async function runDemo() {
+  ensureConnectorsRegistered();
   const runtime = new LocalMemoryRuntime();
-  const session = "demo-session-1";
+  const project = "demo";
+  const baseUrl = process.env.RETAINDB_BASE_URL || `http://localhost:${DEFAULT_PORT}`;
+
+  console.log("RetainDB Local Demo\n");
+
+  // 1. Seed a couple of agent memories so the brain has context.
   await runtime.ingestSession({
-    project: "demo",
-    session_id: session,
+    project,
+    session_id: "demo-session-1",
     user_id: "demo-user",
-    agent_id: "codex",
+    agent_id: "demo",
     events: [
       { kind: "decision", summary: "RetainDB uses jose middleware for JWT auth in src/middleware/auth.ts", salience: "high" },
       { kind: "constraint", summary: "Prefer edge-compatible auth libraries over jsonwebtoken", salience: "medium" },
       { kind: "outcome", summary: "Rate limiting should reuse existing Hono middleware instead of adding Redis", salience: "high" },
     ],
   });
-  const results = await runtime.search({ project: "demo", user_id: "demo-user", query: "how do we handle auth and rate limiting", top_k: 5 });
-  console.log("RetainDB Local demo");
-  console.log(`Store: ${STORE_PATH}`);
-  console.log("");
-  for (const result of results) {
-    console.log(`${result.score.toFixed(2)} ${result.content}`);
-  }
+  console.log(`  1/4 seeded ${3} demo memories\n`);
+
+  // 2. Add a web source (example.com, no auth needed).
+  const sources = new SourceStore(RETAINDB_HOME);
+  const web = sources.create({
+    type: "web",
+    name: "demo-web",
+    project,
+    config: { url: "https://example.com/" },
+  });
+  console.log(`  2/4 created source: ${web.id} (web → https://example.com/)\n`);
+
+  // 3. Sync the web source so the brain has external content.
+  const result = await runSourceSync({
+    source: web,
+    ingest: (input) =>
+      runtime.addMemory({
+        project,
+        content: input.content,
+        memory_type: input.memory_type,
+        importance: input.importance ?? 0.7,
+        confidence: input.confidence ?? 0.8,
+        metadata: {
+          source_id: web.id,
+          source_type: "web",
+          source_title: "Example Domain",
+          external_id: input.metadata?.external_id,
+          citation: input.metadata?.citation,
+        },
+      }),
+    onProgress: (p) => {
+      if (p.stage !== "done") process.stderr.write(`    ${p.stage} ${p.current}/${p.total} ${p.message}\n`);
+    },
+  });
+  sources.update(web.id, {
+    status: result.errors.length > 0 && result.memories_created === 0 ? "error" : "connected",
+    last_synced_at: new Date().toISOString(),
+    last_sync_status: result.errors.length > 0 ? (result.memories_created > 0 ? "partial" : "error") : "ok",
+    last_sync_summary: { documents_indexed: result.documents_indexed, memories_created: result.memories_created, errors: result.errors.length, duration_ms: result.duration_ms },
+    last_error: result.errors.length > 0 ? result.errors.slice(0, 3).join(" | ") : undefined,
+  });
+  console.log(`  3/4 synced web source: ${result.documents_indexed} docs, ${result.memories_created} memories\n`);
+
+  // 4. Ask the brain a question, then show the feedAgent output.
+  const allMemories = (runtime as any).data.memories
+    .filter((m: any) => m.project === project && m.active)
+    .map((m: any) => ({
+      ...m,
+      source_id: m.metadata?.source_id,
+      source_type: m.metadata?.source_type,
+      source_title: m.metadata?.source_title,
+    }));
+  const brain = buildCompanyBrain({ project, memories: allMemories, maxTokens: 4000 });
+  const ask = await askBrain({
+    project,
+    query: "what is an example domain used for",
+    top_k: 8,
+    maxTokens: 2000,
+    includeAgentMemories: true,
+    search: async (input) => {
+      const hits = await runtime.search(input);
+      return hits.map((r: any) => ({
+        memory: {
+          ...r.memory,
+          source_id: r.memory.metadata?.source_id,
+          source_type: r.memory.metadata?.source_type,
+          source_title: r.memory.metadata?.source_title,
+        },
+        score: r.score,
+      }));
+    },
+  });
+  const feed = feedAgent({
+    project,
+    query: "what is an example domain used for",
+    messages: [{ role: "user", content: "What does https://example.com/ say about example domains?" }],
+    maxContextTokens: 2000,
+    includeAgentMemories: true,
+    ask,
+  });
+
+  console.log("  4/4 company brain dump (grouped by source):\n");
+  console.log(brain.text.slice(0, 1200) + (brain.text.length > 1200 ? "\n  … (truncated)\n" : "\n"));
+
+  console.log("  Ask result:\n");
+  console.log(`    query: ${ask.query}`);
+  console.log(`    hits: ${ask.hits}`);
+  console.log(`    citations: ${ask.citations.length}\n`);
+
+  console.log("  FeedAgent system prompt (first 16 lines):\n");
+  const lines = feed.system_prompt.split("\n");
+  console.log(lines.slice(0, 16).map((l) => `    ${l}`).join("\n"));
+  if (lines.length > 16) console.log("    … (truncated)");
+  console.log(`\n    → ${feed.citations.length} citations available`);
+  console.log(`    → ${feed.messages.length} messages (system + user)`);
+  console.log(`\n  ✦ Demo complete. Run \`retaindb start\` to keep the server running,` +
+    ` then add real sources with \`retaindb add github foo/bar --sync\`.`);
 }
 
 function percentile(values: number[], p: number) {
@@ -1998,6 +2795,551 @@ async function importJsonl(pathArg?: string) {
   console.log(JSON.stringify({ imported: true, root, files, memories, store: STORE_PATH }, null, 2));
 }
 
+async function runSourcesCommand() {
+  ensureConnectorsRegistered();
+  const runtime = new LocalMemoryRuntime();
+  const store = new SourceStore(RETAINDB_HOME);
+  const subcommand = process.argv[3] || "list";
+  const project = arg("project") || process.env.RETAINDB_PROJECT || DEFAULT_PROJECT;
+
+  if (subcommand === "list") {
+    console.log(JSON.stringify({ sources: store.list(project) }, null, 2));
+    return;
+  }
+  if (subcommand === "get") {
+    const id = process.argv[4] || arg("id");
+    if (!id) throw new Error("Usage: retaindb sources get <id>");
+    const s = store.get(id);
+    if (!s) throw new Error(`Source ${id} not found`);
+    console.log(JSON.stringify(s, null, 2));
+    return;
+  }
+  if (subcommand === "delete") {
+    const id = process.argv[4] || arg("id");
+    if (!id) throw new Error("Usage: retaindb sources delete <id>");
+    const ok = store.delete(id);
+    console.log(JSON.stringify({ deleted: ok, id }, null, 2));
+    return;
+  }
+  if (subcommand === "sync") {
+    const id = process.argv[4] || arg("id");
+    if (!id) throw new Error("Usage: retaindb sources sync <id>");
+    const source = store.get(id);
+    if (!source) throw new Error(`Source ${id} not found`);
+    store.update(id, { status: "syncing", last_error: undefined });
+    const t0 = Date.now();
+    const result = await runSourceSync({
+      source,
+      ingest: (input) =>
+        runtime.addMemory({
+          project: source.project,
+          content: input.content,
+          memory_type: input.memory_type,
+          importance: input.importance,
+          confidence: input.confidence,
+          agent_id: input.agent_id,
+          session_id: input.session_id,
+          metadata: input.metadata,
+        }),
+      onProgress: (p) => {
+        if (p.stage === "extracting" || p.stage === "indexing") {
+          process.stderr.write(`  ${p.stage} ${p.current}/${p.total} ${p.message}\n`);
+        } else if (p.stage !== "done") {
+          process.stderr.write(`  ${p.stage} ${p.message}\n`);
+        }
+      },
+    });
+    store.update(id, {
+      status: result.errors.length > 0 && result.memories_created === 0 ? "error" : "connected",
+      last_synced_at: new Date().toISOString(),
+      last_sync_status: result.errors.length > 0 ? (result.memories_created > 0 ? "partial" : "error") : "ok",
+      last_sync_summary: {
+        documents_indexed: result.documents_indexed,
+        memories_created: result.memories_created,
+        errors: result.errors.length,
+        duration_ms: result.duration_ms,
+      },
+      last_error: result.errors.length > 0 ? result.errors.slice(0, 3).join(" | ") : undefined,
+    });
+    console.log(JSON.stringify({ source_id: id, result, duration_ms: Date.now() - t0, citations: result.citations.slice(0, 10) }, null, 2));
+    return;
+  }
+  throw new Error("Usage: retaindb sources list|get|delete|sync");
+}
+
+function formatInspectReport(report: ReturnType<LocalMemoryRuntime["inspect"]>) {
+  const lines: string[] = [];
+  const summary = report.summary;
+  lines.push(`RetainDB memory inspection (${report.project})`);
+  lines.push("");
+  lines.push(`Score: ${report.score}/100`);
+  lines.push(`Active memories: ${summary.active_memories}`);
+  lines.push(`Durable memories: ${summary.durable_memories} (${Math.round(summary.durable_ratio * 100)}%)`);
+  lines.push(`Sessions: ${summary.sessions}`);
+  lines.push(`Recalled memories: ${summary.recalled_memories} (${Math.round(summary.recall_ratio * 100)}%)`);
+  lines.push(`Average quality: ${summary.average_quality}`);
+
+  const byType = Object.entries(report.counts.by_type);
+  if (byType.length > 0) {
+    lines.push("");
+    lines.push("Types:");
+    for (const [type, count] of byType.slice(0, 10)) lines.push(`  ${type}: ${count}`);
+  }
+
+  if (report.top_concepts.length > 0) {
+    lines.push("");
+    lines.push("Top concepts:");
+    lines.push(`  ${report.top_concepts.slice(0, 12).map((item) => `${item.name}(${item.count})`).join(", ")}`);
+  }
+
+  if (report.reusable.length > 0) {
+    lines.push("");
+    lines.push("Reusable memory:");
+    for (const memory of report.reusable.slice(0, 5)) {
+      lines.push(`  [${memory.type}] ${memory.content.split("\n")[0].slice(0, 130)}`);
+    }
+  }
+
+  const weakCount = report.risks.weak_memories.length;
+  const staleCount = report.risks.stale_memories.length;
+  const duplicateCount = report.risks.duplicate_candidates.length;
+  if (weakCount || staleCount || duplicateCount) {
+    lines.push("");
+    lines.push("Risks:");
+    if (weakCount) lines.push(`  Weak low-signal memories: ${weakCount}`);
+    if (staleCount) lines.push(`  Stale unrecalled memories: ${staleCount}`);
+    if (duplicateCount) lines.push(`  Duplicate groups: ${duplicateCount}`);
+  }
+
+  lines.push("");
+  lines.push("Next actions:");
+  for (const item of report.recommendations) lines.push(`  - ${item}`);
+  return lines.join("\n");
+}
+
+function runInspectCommand() {
+  const runtime = new LocalMemoryRuntime();
+  const project = arg("project") || process.env.RETAINDB_PROJECT;
+  const report = runtime.inspect(project);
+  if (process.argv.includes("--json") || process.argv.includes("--format=json")) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+  console.log(formatInspectReport(report));
+}
+
+async function runBrainCommand() {
+  ensureConnectorsRegistered();
+  const runtime = new LocalMemoryRuntime();
+  const subcommand = process.argv[3] || "show";
+  const project = arg("project") || process.env.RETAINDB_PROJECT || DEFAULT_PROJECT;
+
+  if (subcommand === "show") {
+    const project2 = slugify(project);
+    const memories = (runtime as any).data.memories
+      .filter((m: any) => m.project === project2 && m.active)
+      .map((m: any) => ({
+        ...m,
+        source_id: m.metadata?.source_id,
+        source_type: m.metadata?.source_type,
+        source_title: m.metadata?.source_title,
+        external_id: m.metadata?.external_id,
+        url: m.metadata?.url,
+        citation: m.metadata?.citation,
+      }));
+    const brain = buildCompanyBrain({ project: project2, memories, maxTokens: Number(arg("maxTokens") || 8000) });
+    if (arg("format") === "text") {
+      console.log(brain.text);
+    } else {
+      console.log(JSON.stringify(brain, null, 2));
+    }
+    return;
+  }
+  if (subcommand === "ask") {
+    const query = process.argv.slice(4).join(" ") || arg("query");
+    if (!query) throw new Error("Usage: retaindb brain ask <query>");
+    const topK = Number(arg("top-k") || arg("topK") || 12);
+    const maxTokens = Number(arg("max-tokens") || 2400);
+    const includeAgent = arg("no-agent") !== "true";
+    const project2 = slugify(project);
+    const result = await askBrain({
+      project: project2,
+      query,
+      top_k: topK,
+      maxTokens,
+      includeAgentMemories: includeAgent,
+      search: async (input) => {
+        const results = await runtime.search(input);
+        return results.map((r: any) => ({
+          memory: {
+            ...r.memory,
+            source_id: r.memory.metadata?.source_id,
+            source_type: r.memory.metadata?.source_type,
+            source_title: r.memory.metadata?.source_title,
+            external_id: r.memory.metadata?.external_id,
+            url: r.memory.metadata?.url,
+            citation: r.memory.metadata?.citation,
+          },
+          score: r.score,
+        }));
+      },
+    });
+    if (arg("format") === "text") {
+      console.log(result.context);
+    } else {
+      console.log(JSON.stringify(result, null, 2));
+    }
+    return;
+  }
+  if (subcommand === "feed") {
+    const query = arg("query");
+    const maxCtx = Number(arg("max-context-tokens") || 2400);
+    const includeAgent = arg("no-agent") !== "true";
+    const project2 = slugify(project);
+    const messagesJson = arg("messages") || "[]";
+    let messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [];
+    try { messages = JSON.parse(messagesJson); } catch { /* ignore */ }
+    if (messages.length === 0) {
+      const stdin = await readStdin();
+      if (stdin) {
+        try { messages = JSON.parse(stdin); } catch { /* ignore */ }
+      }
+    }
+    if (messages.length === 0) {
+      throw new Error("Usage: retaindb brain feed --query <q> --messages '[{...}]'  (or pipe JSON to stdin)");
+    }
+    let ask;
+    if (query) {
+      ask = await askBrain({
+        project: project2,
+        query,
+        top_k: Number(arg("top-k") || 12),
+        maxTokens: maxCtx,
+        includeAgentMemories: includeAgent,
+        search: async (input) => {
+          const results = await runtime.search(input);
+          return results.map((r: any) => ({
+            memory: {
+              ...r.memory,
+              source_id: r.memory.metadata?.source_id,
+              source_type: r.memory.metadata?.source_type,
+              source_title: r.memory.metadata?.source_title,
+              external_id: r.memory.metadata?.external_id,
+              url: r.memory.metadata?.url,
+              citation: r.memory.metadata?.citation,
+            },
+            score: r.score,
+          }));
+        },
+      });
+    }
+    const out = feedAgent({ project: project2, messages, query, maxContextTokens: maxCtx, includeAgentMemories: includeAgent, ask });
+    if (arg("format") === "messages") {
+      console.log(JSON.stringify(out.messages, null, 2));
+    } else if (arg("format") === "system") {
+      console.log(out.system_prompt);
+    } else {
+      console.log(JSON.stringify(out, null, 2));
+    }
+    return;
+  }
+  throw new Error("Usage: retaindb brain show|ask|feed");
+}
+
+async function readStdin(): Promise<string> {
+  if (process.stdin.isTTY) return "";
+  let s = "";
+  for await (const chunk of process.stdin) s += chunk;
+  return s.trim();
+}
+
+function flagName(camel: string): string {
+  return "--" + camel.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
+}
+
+function parseFlag(flag: string): string | string[] | number | boolean | undefined {
+  for (let i = 3; i < process.argv.length; i++) {
+    const a = process.argv[i];
+    if (a === flag) {
+      const next = process.argv[i + 1];
+      if (next === undefined || next.startsWith("--")) return true;
+      return next;
+    }
+    if (a.startsWith(flag + "=")) {
+      return a.slice(flag.length + 1);
+    }
+  }
+  return undefined;
+}
+
+function parseStringArrayFlag(flag: string): string[] | undefined {
+  const raw = parseFlag(flag);
+  if (raw === undefined) return undefined;
+  if (Array.isArray(raw)) return raw as string[];
+  if (typeof raw === "boolean") return [];
+  return String(raw).split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+function parseNumberFlag(flag: string): number | undefined {
+  const raw = parseFlag(flag);
+  if (raw === undefined) return undefined;
+  if (typeof raw === "boolean") return undefined;
+  const n = Number(raw);
+  return isNaN(n) ? undefined : n;
+}
+
+function parseBooleanFlag(flag: string): boolean | undefined {
+  const raw = parseFlag(flag);
+  if (raw === undefined) return undefined;
+  if (typeof raw === "boolean") return raw;
+  if (raw === "true" || raw === "1" || raw === "yes") return true;
+  if (raw === "false" || raw === "0" || raw === "no") return false;
+  return undefined;
+}
+
+async function prompt(question: string, opts: { silent?: boolean } = {}): Promise<string> {
+  if (!process.stdin.isTTY) {
+    throw new Error(`Missing required value: ${question}\n(Re-run interactively, pass it as a flag, or pipe into stdin)`);
+  }
+  process.stdout.write(question);
+  return await new Promise((resolve) => {
+    let s = "";
+    const onData = (chunk: Buffer) => {
+      s += chunk.toString("utf8");
+      if (s.endsWith("\n")) {
+        process.stdin.removeListener("data", onData);
+        process.stdin.pause();
+        resolve(s.replace(/\r?\n$/, ""));
+      }
+    };
+    process.stdin.resume();
+    process.stdin.on("data", onData);
+  });
+}
+
+function maskSecret(value: string): string {
+  if (!value) return "";
+  if (value.length <= 4) return "****";
+  return "****" + value.slice(-4);
+}
+
+function printConnectorsList(): void {
+  const descs = listConnectorDescriptors();
+  console.log("Available connectors:");
+  for (const d of descs) {
+    console.log(`  ${d.type.padEnd(12)} ${d.requiresAuth ? "[auth]" : "[no-auth]"}  ${d.description}`);
+  }
+  console.log("\nRun `retaindb describe <type>` for the full config schema and an example.");
+}
+
+function printSchemaHuman(s: ReturnType<typeof getConnector> extends infer C ? (C extends { schema: () => infer S } ? S : never) : never): void {
+  console.log(`${s.type} — ${s.summary}`);
+  console.log(`auth: ${s.requiresAuth ? "required" : "not required"}`);
+  if (s.positionalHint) console.log(`usage:  retaindb add ${s.type} ${s.positionalHint} [--flag=value ...]`);
+  console.log("\nFields:");
+  for (const f of s.fields) {
+    const req = f.required ? "required" : `optional${f.default !== undefined ? ` (default: ${String(f.default)})` : ""}`;
+    const sec = f.secret ? " [secret]" : "";
+    const cli = f.cliFlag ? ` [--${f.cliFlag}]` : (f.positional ? ` (positional: ${f.positional})` : "");
+    console.log(`  ${f.name.padEnd(18)} ${f.type.padEnd(10)} ${req}${sec}${cli}`);
+    console.log(`    ${f.description}`);
+  }
+  console.log("\nExample:");
+  console.log("  " + JSON.stringify(s.example, null, 2).split("\n").join("\n  "));
+}
+
+function runDescribeCommand(): void {
+  ensureConnectorsRegistered();
+  const type = process.argv[3];
+  if (!type || type === "--help" || type === "-h" || type === "all") {
+    printConnectorsList();
+    return;
+  }
+  const provider = getConnector(type as any);
+  if (!provider) {
+    console.error(`Unknown connector: ${type}\nRun \`retaindb describe\` for a list.`);
+    process.exit(1);
+  }
+  printSchemaHuman(provider.schema());
+}
+
+async function runAddCommand(): Promise<void> {
+  ensureConnectorsRegistered();
+  const type = process.argv[3];
+  if (!type || type === "--help" || type === "-h") {
+    printConnectorsList();
+    console.log("\nUsage: retaindb add <type> [args...] [--sync] [--name=...] [--project=...]");
+    return;
+  }
+  const provider = getConnector(type as any);
+  if (!provider) {
+    console.error(`Unknown connector: ${type}\nRun \`retaindb describe\` for a list.`);
+    process.exit(1);
+  }
+  const schema = provider.schema();
+  const positional = schema.fields.filter((f) => f.positional).sort((a, b) => {
+    if (!a.positional) return 1;
+    if (!b.positional) return -1;
+    return schema.fields.indexOf(a) - schema.fields.indexOf(b);
+  });
+  const config: Record<string, unknown> = {};
+  // Pull positional values from process.argv (after the connector type)
+  const positionalValues: string[] = [];
+  for (let i = 4; i < process.argv.length; i++) {
+    const a = process.argv[i];
+    if (a.startsWith("--")) break;
+    positionalValues.push(a);
+  }
+  // github's owner/repo can be supplied as "owner/repo" (combined positional)
+  if (type === "github" && positionalValues.length === 1 && positionalValues[0].includes("/")) {
+    const [owner, ...rest] = positionalValues[0].split("/");
+    config["owner"] = owner;
+    config["repo"] = rest.join("/");
+  } else {
+    for (let i = 0; i < positional.length; i++) {
+      const f = positional[i];
+      const v = positionalValues[i];
+      if (v) {
+        config[f.name] = f.type === "string[]" ? v.split(",").map((s) => s.trim()).filter(Boolean) : v;
+      }
+    }
+  }
+  // Pull named flags
+  for (const f of schema.fields) {
+    if (config[f.name] !== undefined) continue;
+    const flag = "--" + (f.cliFlag || f.name);
+    if (f.type === "string[]") {
+      const v = parseStringArrayFlag(flag);
+      if (v !== undefined) config[f.name] = v;
+    } else if (f.type === "number") {
+      const v = parseNumberFlag(flag);
+      if (v !== undefined) config[f.name] = v;
+    } else if (f.type === "boolean") {
+      const v = parseBooleanFlag(flag);
+      if (v !== undefined) config[f.name] = v;
+    } else {
+      const v = parseFlag(flag);
+      if (v !== undefined && typeof v !== "boolean") config[f.name] = v;
+    }
+  }
+  // Apply defaults
+  for (const f of schema.fields) {
+    if (config[f.name] === undefined && f.default !== undefined) config[f.name] = f.default;
+  }
+  // Prompt for missing required fields (TTY only)
+  for (const f of schema.fields) {
+    if (config[f.name] === undefined && f.required) {
+      const value = await prompt(`${f.name} (${f.description}): `, { silent: f.secret });
+      if (!value) {
+        console.error(`\n  ✗ ${f.name} is required — aborting.`);
+        process.exit(2);
+      }
+      if (f.type === "number") {
+        const n = Number(value);
+        if (isNaN(n)) {
+          console.error(`\n  ✗ ${f.name} must be a number, got: ${value}`);
+          process.exit(2);
+        }
+        config[f.name] = n;
+      } else if (f.type === "string[]") {
+        config[f.name] = value.split(",").map((s) => s.trim()).filter(Boolean);
+      } else {
+        config[f.name] = value;
+      }
+    }
+  }
+  // Re-validate via the connector
+  const validation = provider.validateConfig(config);
+  if (!validation.ok) {
+    console.error(`  ✗ ${validation.error}`);
+    console.error(`\n  hint: run \`retaindb describe ${type}\` for the full schema.`);
+    process.exit(2);
+  }
+  // Echo the (secret-redacted) config so the user can confirm
+  console.log("  ✓ config valid");
+  const redacted: Record<string, unknown> = {};
+  for (const f of schema.fields) {
+    const v = config[f.name];
+    if (v === undefined) continue;
+    redacted[f.name] = f.secret && typeof v === "string" ? maskSecret(v) : v;
+  }
+  console.log("  config:", JSON.stringify(redacted));
+  // POST to the local server
+  const baseUrl = process.env.RETAINDB_BASE_URL || `http://localhost:${DEFAULT_PORT}`;
+  const project = arg("project") || process.env.RETAINDB_PROJECT || DEFAULT_PROJECT;
+  const explicitName = arg("name");
+  const name = explicitName || `${type}-${Date.now().toString(36).slice(-6)}`;
+  const res = await fetch(`${baseUrl}/v1/sources`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type, name, project, config }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    console.error(`  ✗ server returned ${res.status}: ${JSON.stringify(body)}`);
+    process.exit(1);
+  }
+  const id = body.id;
+  console.log(`  ✓ source created: ${id} (${name})`);
+  if (process.argv.includes("--sync") || process.argv.includes("--sync-now")) {
+    console.log("  ↳ syncing now…");
+    const syncRes = await fetch(`${baseUrl}/v1/sources/${id}/sync`, { method: "POST" });
+    const syncBody = await syncRes.json();
+    if (!syncRes.ok) {
+      console.error(`  ✗ sync failed: ${JSON.stringify(syncBody)}`);
+      process.exit(1);
+    }
+    const r = syncBody.result || {};
+    console.log(`  ✓ sync done: docs=${r.documents_indexed} memories=${r.memories_created} errors=${(r.errors || []).length} duration=${r.duration_ms}ms`);
+  } else {
+    console.log(`  ↳ run \`retaindb sources sync ${id}\` (or re-run with --sync) to ingest.`);
+  }
+}
+
+function runHelpCommand(): void {
+  console.log(`RetainDB Local — persistent memory for coding agents.
+
+Usage:
+  retaindb <command> [args]
+
+Core:
+  start [--port=N]                          Start the local server + viewer (default).
+  mcp                                      Run the local server's MCP bridge on stdio.
+  status | doctor | inspect | benchmark | demo
+                                           Inspect health, stats, and smoke tests.
+  files sync|list|read|write               Repo-local .retaindb/files brain.
+
+Sources (connectors -> memory):
+  connectors                                List registered connectors (text).
+  describe <type|all>                       Print the full config schema + example.
+  add <type> [args] [--sync]                Create a source. Positional + flags per type.
+  sources list|get|delete|sync              Mirror of the HTTP routes.
+
+Agent context:
+  brain show [--project=...] [--format=text]   Dump the whole company brain, grouped by source.
+  brain ask <query> [--top-k=N] [--max-tokens=N]   Search the brain; returns context + citations.
+  brain feed --query=... --messages=...      LLM-ready system prompt + message list.
+
+  connect [all|codex|claude-code|opencode]   Write agent-bridge snippets (unchanged).
+
+Memory:
+  inspect [--project=...] [--json]           Score memory quality and show cleanup actions.
+  memory write ...                            Alias for POST /v1/memory.
+
+Help:
+  help                                      This screen.
+  describe <type>                           Schema + example for one connector.
+  <command> --help                          Per-command help (where available).
+
+Environment:
+  RETAINDB_HOME       Local data directory (default: ~/.retaindb).
+  RETAINDB_BASE_URL   Server URL for CLI calls (default: http://localhost:<port>).
+  RETAINDB_PORT       Server port (default: 3111).
+  RETAINDB_PROJECT    Default project name (default: "default").
+  RETAINDB_KEY        API key for the @retaindb/sdk client (local accepts any non-empty).
+`);
+}
+
 async function runFilesCommand() {
   const runtime = new LocalMemoryRuntime();
   const subcommand = process.argv[3] || "sync";
@@ -2085,6 +3427,21 @@ async function main() {
   }
   if (command === "hook") return runHook();
   if (command === "files") return runFilesCommand();
+  if (command === "sources") return runSourcesCommand();
+  if (command === "brain") return runBrainCommand();
+  if (command === "inspect") return runInspectCommand();
+  if (command === "connectors") {
+    ensureConnectorsRegistered();
+    if (process.argv.includes("--json") || process.argv.includes("--format=json")) {
+      console.log(JSON.stringify(listConnectorDescriptors(), null, 2));
+    } else {
+      printConnectorsList();
+    }
+    return;
+  }
+  if (command === "describe") return runDescribeCommand();
+  if (command === "add") return runAddCommand();
+  if (command === "help" || command === "--help" || command === "-h") return runHelpCommand();
   if (command === "import-jsonl") return importJsonl(process.argv[3]);
   if (command === "consolidate") {
     const runtime = new LocalMemoryRuntime();
@@ -2112,6 +3469,7 @@ async function main() {
   console.log("  retaindb                 Start local memory server");
   console.log("  retaindb mcp             Run the bundled MCP bridge against local memory");
   console.log("  retaindb demo            Seed and search demo memories");
+  console.log("  retaindb inspect         Score memory quality and show cleanup actions");
   console.log("  retaindb benchmark       Run a small local recall/latency benchmark");
   console.log("  retaindb install-embeddings  Warm local transformer embeddings and model cache");
   console.log("  retaindb connect all     Write Codex/Claude Code/OpenCode snippets");

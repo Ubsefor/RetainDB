@@ -5,14 +5,12 @@
 import { RuntimeClient, RuntimeClientError } from "./core/client.js";
 import {
   RetainDBError,
-  RetainDBError as WhisperError,
   type RetainDBErrorCode,
-  type RetainDBErrorCode as WhisperErrorCode,
 } from "./errors.js";
 import type { LearnInput, LearnResult, LearnSourceResult } from "./modules/types.js";
 
 export interface RetainDBConfig {
-  apiKey?: string;
+  apiKey: string;
   baseUrl?: string;
   project?: string;
   timeoutMs?: number;
@@ -47,7 +45,7 @@ export interface QueryParams {
   compression_strategy?: "summarize" | "extract" | "delta" | "adaptive";
   use_cache?: boolean;
   include_parent_content?: boolean;
-  retrieval_profile?: "legacy" | "precision_v1";
+  retrieval_profile?: "legacy" | "precision_v1" | "fast" | "balanced" | "vector" | "lexical" | string;
 }
 
 export interface QueryResult {
@@ -76,7 +74,7 @@ export interface QueryResult {
       matched_sources?: number;
     };
     profile?: string;
-    retrieval_profile?: "legacy" | "precision_v1";
+    retrieval_profile?: "legacy" | "precision_v1" | "fast" | "balanced" | "vector" | "lexical" | string;
     compression?: any;
     timing?: {
       cache_check_ms?: number;
@@ -90,6 +88,46 @@ export interface QueryResult {
       total_ms?: number;
       [key: string]: number | undefined;
     };
+  };
+}
+
+export interface ContextFilesystemParams {
+  project?: string;
+  path?: string;
+  includeContents?: boolean;
+  include_contents?: boolean;
+  limit?: number;
+}
+
+export interface ContextFilesystemEntry {
+  path: string;
+  name: string;
+  type: "file" | "directory";
+  title?: string;
+  parent?: string | null;
+  mimeType?: string;
+  size?: number;
+  updatedAt?: string;
+  metadata?: Record<string, any>;
+  content?: string;
+  children?: ContextFilesystemEntry[];
+}
+
+export interface ContextFilesystemResult {
+  projectId: string;
+  generatedAt: string;
+  root: string;
+  requestedPath: string;
+  tree: ContextFilesystemEntry[];
+  read: ContextFilesystemEntry | null;
+  directory: (ContextFilesystemEntry & { children?: ContextFilesystemEntry[] }) | null;
+  stats: {
+    directories: number;
+    files: number;
+    sources: number;
+    documents: number;
+    memories: number;
+    recentQueries: number;
   };
 }
 
@@ -409,8 +447,19 @@ export class RetainDBContext {
   private projectCacheExpiresAt = 0;
 
   constructor(config: RetainDBConfig) {
-    this.apiKey = config.apiKey || "";
-    this.baseUrl = normalizeBaseUrl(config.baseUrl || "https://api.retaindb.com");
+    const baseUrl = normalizeBaseUrl(config.baseUrl || "https://api.retaindb.com");
+    if (!config.apiKey) {
+      const isLocal = /localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(baseUrl);
+      if (!isLocal) {
+        throw new RetainDBError({
+          code: "INVALID_API_KEY",
+          message: "API key is required for non-local servers. For a local server, pass apiKey: \"local-no-auth\" or set RETAINDB_KEY=local-no-auth.",
+        });
+      }
+    }
+
+    this.apiKey = config.apiKey || "local-no-auth";
+    this.baseUrl = baseUrl;
     this.defaultProject = config.project;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.retryConfig = {
@@ -508,7 +557,7 @@ export class RetainDBContext {
       }>(`/v1/projects/resolve?project=${encodeURIComponent(projectRef)}`, { method: "GET" });
       return response?.resolved || null;
     } catch (error) {
-      if (error instanceof WhisperError && error.code === "PROJECT_NOT_FOUND") {
+      if (error instanceof RetainDBError && error.code === "PROJECT_NOT_FOUND") {
         return null;
       }
       throw error;
@@ -569,7 +618,7 @@ export class RetainDBContext {
       };
     }
 
-    throw new WhisperError({
+    throw new RetainDBError({
       code: "PROJECT_NOT_FOUND",
       message: `Project '${resolvedRef}' not found`,
     });
@@ -592,7 +641,7 @@ export class RetainDBContext {
     }
 
     if (matches.length > 1) {
-      throw new WhisperError({
+      throw new RetainDBError({
         code: "PROJECT_AMBIGUOUS",
         message: `Project reference '${projectRef}' matched multiple projects. Use project id instead.`,
       });
@@ -615,7 +664,7 @@ export class RetainDBContext {
       return resolvedProject.id;
     }
 
-    throw new WhisperError({
+    throw new RetainDBError({
       code: "PROJECT_NOT_FOUND",
       message: `Project '${projectRef}' not found`,
     });
@@ -653,7 +702,7 @@ export class RetainDBContext {
     try {
       return await execute(projectRef);
     } catch (error) {
-      if (!(error instanceof WhisperError) || error.code !== "PROJECT_NOT_FOUND") {
+      if (!(error instanceof RetainDBError) || error.code !== "PROJECT_NOT_FOUND") {
         throw error;
       }
     }
@@ -667,7 +716,7 @@ export class RetainDBContext {
         return await execute(ref);
       } catch (error) {
         lastError = error;
-        if (error instanceof WhisperError && error.code === "PROJECT_NOT_FOUND") {
+        if (error instanceof RetainDBError && error.code === "PROJECT_NOT_FOUND") {
           continue;
         }
         throw error;
@@ -678,14 +727,14 @@ export class RetainDBContext {
       throw lastError;
     }
 
-    throw new WhisperError({
+    throw new RetainDBError({
       code: "PROJECT_NOT_FOUND",
       message: `Project '${projectRef}' not found`,
     });
   }
 
   private shouldRetryWithResolvedProjectId(error: unknown): boolean {
-    return error instanceof WhisperError
+    return error instanceof RetainDBError
       && error.status === 404
       && !this.isEndpointNotFoundError(error);
   }
@@ -704,7 +753,7 @@ export class RetainDBContext {
 
     const resolvedProjectId = await this.resolveProjectId(projectRef);
     if (resolvedProjectId === projectRef) {
-      throw new WhisperError({
+      throw new RetainDBError({
         code: "PROJECT_NOT_FOUND",
         message: `Project '${projectRef}' not found`,
       });
@@ -712,7 +761,7 @@ export class RetainDBContext {
     return execute(resolvedProjectId);
   }
 
-  private classifyError(status: number | undefined, message: string): { code: WhisperErrorCode; retryable: boolean } {
+  private classifyError(status: number | undefined, message: string): { code: RetainDBErrorCode; retryable: boolean } {
     if (status === 401 || /api key|unauthorized|forbidden/i.test(message)) {
       return { code: "INVALID_API_KEY", retryable: false };
     }
@@ -732,7 +781,7 @@ export class RetainDBContext {
   }
 
   private isEndpointNotFoundError(error: unknown): boolean {
-    if (!(error instanceof WhisperError)) {
+    if (!(error instanceof RetainDBError)) {
       return false;
     }
     if (error.status !== 404) {
@@ -748,7 +797,7 @@ export class RetainDBContext {
     if (normalized.includes("/memory/bulk")) return "bulk";
     if (normalized.includes("/memory/profile") || normalized.includes("/memory/session")) return "profile";
     if (normalized.includes("/memory/ingest/session")) return "session";
-    if (normalized.includes("/context/query")) return "query";
+    if (normalized.includes("/context")) return "query";
     if (method === "GET") return "get";
     return "writeAck";
   }
@@ -797,7 +846,7 @@ export class RetainDBContext {
         message = `Endpoint not found at ${endpointHint}. This deployment may not support this API route.`;
       }
       const { code, retryable } = this.classifyError(error.status, message);
-      throw new WhisperError({
+      throw new RetainDBError({
         code,
         message,
         status: error.status,
@@ -816,6 +865,65 @@ export class RetainDBContext {
       method: "POST",
       body: JSON.stringify({ ...params, project }),
     }));
+  }
+
+  async readContextFile(params: ContextFilesystemParams = {}): Promise<ContextFilesystemResult> {
+    const projectRef = this.getRequiredProject(params.project);
+    return this.withProjectRefFallback(projectRef, async (project) => {
+      try {
+        return await this.request<ContextFilesystemResult>("/v1/context/files", {
+          method: "POST",
+          body: JSON.stringify({ ...params, project }),
+        });
+      } catch (error) {
+        if (!this.isEndpointNotFoundError(error)) {
+          throw error;
+        }
+        const query = new URLSearchParams({
+          project,
+          ...params.path ? { path: params.path } : {},
+          ...params.includeContents !== void 0 ? { includeContents: String(params.includeContents) } : {},
+          ...params.include_contents !== void 0 ? { include_contents: String(params.include_contents) } : {},
+          ...params.limit !== void 0 ? { limit: String(params.limit) } : {},
+        });
+        const local = await this.request<any>(`/v1/context/files?${query}`, { method: "GET" });
+        return this.normalizeContextFilesystemResult(local, project, params.path);
+      }
+    });
+  }
+
+  private normalizeContextFilesystemResult(value: any, project: string, requestedPath?: string): any {
+    if (value?.projectId && Array.isArray(value?.tree)) return value;
+    const rawFiles = Array.isArray(value?.tree) ? value.tree : Array.isArray(value?.files) ? value.files : [];
+    const tree = rawFiles.map((e: any) => ({
+      path: String(e?.path || ""),
+      type: e?.type === "directory" ? "directory" : "file",
+      bytes: typeof e?.bytes === "number" ? e.bytes : undefined,
+      updatedAt: e?.updatedAt ? String(e.updatedAt) : undefined,
+    }));
+    const entryFor = (e: any) => e ? ({
+      path: String(e?.path || ""),
+      type: e?.type === "directory" ? "directory" : "file",
+      bytes: typeof e?.bytes === "number" ? e.bytes : undefined,
+      updatedAt: e?.updatedAt ? String(e.updatedAt) : undefined,
+      content: typeof e?.content === "string" ? e.content : undefined,
+    }) : null;
+    const read = value?.read ? entryFor(value.read) : value?.file ? entryFor(value.file) : null;
+    const directory = value?.directory ? entryFor(value.directory) : null;
+    return {
+      projectId: project,
+      generatedAt: value?.generatedAt || new Date().toISOString(),
+      root: String(value?.root || "/"),
+      requestedPath: String(value?.requestedPath || requestedPath || value?.file?.path || "/"),
+      tree,
+      read,
+      directory,
+      stats: value?.stats || {
+        directories: tree.filter((e: any) => e.type === "directory").length,
+        files: tree.filter((e: any) => e.type === "file").length + (read ? 1 : 0),
+        sources: 0, documents: 0, memories: 0, recentQueries: 0,
+      },
+    };
   }
 
   async createProject(params: {
@@ -882,16 +990,44 @@ export class RetainDBContext {
       sync_schedule?: string;
     }
   ): Promise<Source> {
-    return this.withProjectPathFallback(this.getRequiredProject(projectId), (projectPathRef) =>
-      this.request<Source>(`/v1/projects/${encodeURIComponent(projectPathRef)}/sources`, {
+    return this.withProjectPathFallback(this.getRequiredProject(projectId), async (projectPathRef) => {
+      const created = await this.request<any>(`/v1/sources`, {
         method: "POST",
-        body: JSON.stringify(params),
-      })
-    );
+        body: JSON.stringify({
+          project: projectPathRef,
+          name: params.name,
+          type: params.connector_type,
+          config: params.config,
+          sync_schedule: params.sync_schedule,
+        }),
+      });
+      return created?.source || created;
+    });
   }
 
   async syncSource(sourceId: string): Promise<any> {
     return this.request(`/v1/sources/${sourceId}/sync`, { method: "POST" });
+  }
+
+  async updateSource(
+    sourceId: string,
+    params: {
+      project?: string;
+      name?: string;
+      config?: Record<string, any>;
+      configPatch?: Record<string, any>;
+      sync?: boolean;
+    }
+  ): Promise<any> {
+    return this.request(`/v1/sources/${encodeURIComponent(sourceId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(params),
+    });
+  }
+
+  async deleteSource(sourceId: string, project?: string): Promise<any> {
+    const query = project ? `?project=${encodeURIComponent(project)}` : "";
+    return this.request(`/v1/sources/${encodeURIComponent(sourceId)}${query}`, { method: "DELETE" });
   }
 
   async addSourceByType(
@@ -1245,7 +1381,7 @@ export class RetainDBContext {
 
       const id = legacy?.memory?.id || legacy?.id || legacy?.memory_id;
       if (!id) {
-        throw new WhisperError({
+        throw new RetainDBError({
           code: "REQUEST_FAILED",
           message: "Memory create succeeded but no memory id was returned by the API",
         });
@@ -1380,11 +1516,17 @@ export class RetainDBContext {
     session_id?: string;
     agent_id?: string;
     task_id?: string;
+    question_date?: string;
     memory_type?: MemoryKind;
     scope_targets?: MemoryScopeTarget[];
     top_k?: number;
     profile?: "fast" | "balanced" | "quality";
     include_pending?: boolean;
+    source_ids?: string[];
+    tags?: string[];
+    namespace?: string;
+    include_memories?: boolean;
+    include_relations?: boolean;
   }): Promise<MemorySearchResponse> {
     const projectRef = this.getRequiredProject(params.project);
     return this.withProjectRefFallback(projectRef, async (project) => {
@@ -1398,11 +1540,17 @@ export class RetainDBContext {
             session_id: params.session_id,
             agent_id: params.agent_id,
             task_id: params.task_id,
+            question_date: params.question_date,
             scope_targets: params.scope_targets,
             memory_types: params.memory_type ? [params.memory_type] : undefined,
             top_k: params.top_k || 10,
             profile: params.profile,
             include_pending: params.include_pending,
+            source_ids: params.source_ids,
+            tags: params.tags,
+            namespace: params.namespace,
+            include_memories: params.include_memories,
+            include_relations: params.include_relations,
           }),
         });
       } catch (error) {
@@ -1468,9 +1616,13 @@ export class RetainDBContext {
     top_k?: number;
     memory_types?: MemoryKind[];
     scope_targets?: MemoryScopeTarget[];
+    source_ids?: string[];
     include_inactive?: boolean;
     include_chunks?: boolean;
+    include_memories?: boolean;
     include_relations?: boolean;
+    tags?: string[];
+    namespace?: string;
     fast_mode?: boolean;
     profile?: "fast" | "balanced" | "quality";
     include_pending?: boolean;
@@ -1497,9 +1649,15 @@ export class RetainDBContext {
           task_id: params.task_id,
           memory_type: firstType,
           scope_targets: params.scope_targets,
+          question_date: params.question_date,
           top_k: params.top_k,
           profile: params.profile,
           include_pending: params.include_pending,
+          source_ids: params.source_ids,
+          tags: params.tags,
+          namespace: params.namespace,
+          include_memories: params.include_memories,
+          include_relations: params.include_relations,
         });
       }
     });
@@ -1663,6 +1821,9 @@ export class RetainDBContext {
     project?: string;
     user_id?: string;
     session_id?: string;
+    session_ids?: string[];
+    view?: "default" | "temporal" | "entity" | "session";
+    entity?: string;
     include_inactive?: boolean;
     limit?: number;
   }): Promise<any> {
@@ -1672,6 +1833,9 @@ export class RetainDBContext {
         project,
         ...(params.user_id && { user_id: params.user_id }),
         ...(params.session_id && { session_id: params.session_id }),
+        ...(params.session_ids?.length ? { session_ids: params.session_ids.join(",") } : {}),
+        ...(params.view && { view: params.view }),
+        ...(params.entity && { entity: params.entity }),
         ...(params.include_inactive !== undefined && { include_inactive: String(params.include_inactive) }),
         ...(params.limit !== undefined && { limit: String(params.limit) }),
       });
@@ -1694,6 +1858,28 @@ export class RetainDBContext {
       });
       return this.request(`/v1/memory/graph/conversation/${params.session_id}?${query}`);
     });
+  }
+
+  async getUserModel(params: { project?: string; user_id: string }): Promise<any> {
+    const projectRef = this.getRequiredProject(params.project);
+    return this.withProjectRefFallback(projectRef, (project) => {
+      const query = new URLSearchParams({ project });
+      return this.request(`/v1/memory/profile/${params.user_id}/model?${query}`);
+    });
+  }
+
+  async getUserGaps(params: { project?: string; user_id: string; context: string; limit?: number }): Promise<any> {
+    const projectRef = this.getRequiredProject(params.project);
+    return this.withProjectRefFallback(projectRef, (project) =>
+      this.request(`/v1/memory/profile/${params.user_id}/gaps`, {
+        method: "POST",
+        body: JSON.stringify({
+          project,
+          context: params.context,
+          ...(params.limit !== undefined ? { limit: params.limit } : {}),
+        }),
+      })
+    );
   }
 
   async oracleSearch(params: {
@@ -1998,6 +2184,11 @@ export class RetainDBContext {
   };
 
   readonly sources = {
+    list: (project?: string) => this.listSources(project),
+    create: (
+      projectId: string,
+      params: { name: string; connector_type: string; config: Record<string, any>; sync_schedule?: string }
+    ) => this.addSource(projectId, params),
     add: (
       projectId: string,
       params: { name: string; connector_type: string; config: Record<string, any>; sync_schedule?: string }
@@ -2018,6 +2209,10 @@ export class RetainDBContext {
     ) => this.addSourceByType(projectId, params),
     sync: (sourceId: string) => this.syncSource(sourceId),
     syncSource: (sourceId: string) => this.syncSource(sourceId),
+    update: (sourceId: string, params: Parameters<RetainDBContext["updateSource"]>[1]) => this.updateSource(sourceId, params),
+    updateSource: (sourceId: string, params: Parameters<RetainDBContext["updateSource"]>[1]) => this.updateSource(sourceId, params),
+    delete: (sourceId: string, project?: string) => this.deleteSource(sourceId, project),
+    deleteSource: (sourceId: string, project?: string) => this.deleteSource(sourceId, project),
     status: (sourceId: string) => this.getSourceStatus(sourceId),
     getStatus: (sourceId: string) => this.getSourceStatus(sourceId),
   };
@@ -2039,6 +2234,8 @@ export class RetainDBContext {
     getRelations: (memoryId: string) => this.getMemoryRelations(memoryId),
     getGraph: (params: Parameters<RetainDBContext["getMemoryGraph"]>[0]) => this.getMemoryGraph(params),
     getConversationGraph: (params: Parameters<RetainDBContext["getConversationGraph"]>[0]) => this.getConversationGraph(params),
+    getModel: (params: Parameters<RetainDBContext["getUserModel"]>[0]) => this.getUserModel(params),
+    getGaps: (params: Parameters<RetainDBContext["getUserGaps"]>[0]) => this.getUserGaps(params),
     consolidate: (params: Parameters<RetainDBContext["consolidateMemories"]>[0]) => this.consolidateMemories(params),
     updateDecay: (params: Parameters<RetainDBContext["updateImportanceDecay"]>[0]) => this.updateImportanceDecay(params),
     getImportanceStats: (project?: string) => this.getImportanceStats(project),
@@ -2055,6 +2252,9 @@ export class RetainDBContext {
   };
 
   readonly context = {
+    query: (params: QueryParams) => this.query(params),
+    files: (params?: ContextFilesystemParams) => this.readContextFile(params || {}),
+    readFile: (path: string, params?: Omit<ContextFilesystemParams, "path">) => this.readContextFile({ ...(params || {}), path, includeContents: true }),
     createShare: (params: Parameters<RetainDBContext["createSharedContext"]>[0]) => this.createSharedContext(params),
     loadShare: (shareId: string) => this.loadSharedContext(shareId),
     resumeShare: (params: Parameters<RetainDBContext["resumeFromSharedContext"]>[0]) => this.resumeFromSharedContext(params),
@@ -2070,18 +2270,29 @@ export class RetainDBContext {
   };
 }
 
-export { RetainDBClient } from "./whisper.js";
+export { RetainDBClient } from "./context.js";
 export { RetainDBError };
 export type { RetainDBErrorCode };
 export type {
   RunContext,
   RetainDBClientConfig,
+  RetainDBEnvironment,
+  RetainDBIdentityMode,
+  RetainDBPreflightCheck,
+  RetainDBPreflightResult,
+  RetainDBResolvedIdentity,
+  RetainDBAgentScope,
+  RetainDBTaskScope,
+  AgentMemoryEventInput,
+  AgentMemoryContextInput,
+  AgentMemoryHandoffInput,
   RememberParams,
   IngestParams,
   QueryInput,
-} from "./whisper.js";
+} from "./context.js";
 export type {
   AgentRunContext,
+  RetainDBAgentRuntime,
   AgentRuntimeRankWeights,
   AgentRuntimeRetrievalOptions,
   AgentRuntimeSourceActivityOptions,
@@ -2112,18 +2323,16 @@ export { withRetainDB } from "./adapters/ai-sdk.js";
 export { retaindbTools } from "./adapters/tools.js";
 export type { RetainDBToolDefinition, RetainDBToolsOptions } from "./adapters/tools.js";
 export {
-  createMemoryRouter,
   RetainDBMemoryRouter,
+  createMemoryRouter,
   type MemoryRouterConfig,
   type MemoryRouterResult,
   type MemoryRouterTrace,
   type MemoryRouterFallbackReason,
 } from "./router/memory-router.js";
 export { memoryGraphToMermaid } from "./graph-utils.js";
-export { FilesModule } from "./modules/files.js";
-export type { SharedFile, FileScope, StoreOptions, StoreResult } from "./modules/files.js";
-export { RetainDB as default } from "./retaindb.js";
+export default RetainDBContext;
 
 // Primary SDK — use RetainDB for new projects
 export { RetainDB } from "./retaindb.js";
-export type { RetainDBOptions, Message, TurnContext, UserScope, SessionScope, AgentScope, AgentWorkEvent, MemoryItem } from "./retaindb.js";
+export type { RetainDBOptions, Message, TurnContext, UserScope, SessionScope, MemoryItem } from "./retaindb.js";

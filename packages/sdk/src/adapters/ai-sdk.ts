@@ -1,6 +1,6 @@
 import type { QueryParams } from "../index.js";
 import { RetainDBError } from "../errors.js";
-import { RetainDBClient, type RetainDBClientConfig } from "../whisper.js";
+import { RetainDBClient, type RetainDBClientConfig } from "../context.js";
 
 type AnyRecord = Record<string, unknown>;
 
@@ -146,8 +146,8 @@ function buildClient(config: WithRetainDBOptions): RetainDBClient {
   const apiKey =
     config.apiKey ||
     env.RETAINDB_API_KEY ||
-    env.WHISPER_API_KEY ||
-    env.USEWHISPER_API_KEY ||
+    env.RetainDB_API_KEY ||
+    env.USERetainDB_API_KEY ||
     env.API_KEY;
   if (!apiKey) {
     throw new RetainDBError({

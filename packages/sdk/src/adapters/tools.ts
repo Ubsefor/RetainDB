@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { RetainDBError } from "../errors.js";
-import { RetainDBClient, type RetainDBClientConfig } from "../whisper.js";
+import { RetainDBClient, type RetainDBClientConfig } from "../context.js";
 
 export interface RetainDBToolsOptions
   extends Partial<Omit<RetainDBClientConfig, "apiKey">> {
