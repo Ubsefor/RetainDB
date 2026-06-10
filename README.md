@@ -47,6 +47,27 @@ npx -y @retaindb/local
 
 RetainDB Local starts an API on `http://localhost:3111` and a viewer on `http://localhost:3113`.
 
+Or use docker compose to run RetainDB in container:
+
+```bash
+git clone https://github.com/retaindb/retaindb
+```
+
+Set the correct directory path for `RETAINDB_HOME` map in `docker-compose-local.yml`.
+Run docker compose:
+
+```bash
+cd retaindb
+docker compose -f docker-compose-local.yml up -d
+```
+To see the container logs:
+
+```bash
+docker compose -f docker-compose-local.yml logs -f -n 10
+```
+
+RetainDB Local inside container starts an API on `http://localhost:3111` and a viewer on `http://localhost:3113`.
+
 Run the demo:
 
 ```bash
