@@ -1,0 +1,27 @@
+version: "3.9"
+
+name: retaindb-local
+services:
+  retaindb-local:
+    image: retaindb:local
+    build:
+      context: .
+      dockerfile: packages/local/Dockerfile
+    container_name: retaindb-local
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3111:3111"
+      - "0.0.0.0:3113:3113"
+    environment:
+      - RETAINDB_HOME=/opt/retaindb/data
+    volumes:
+      - /path/to/docker/volumes/folder/retaindb:/opt/retaindb
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          (curl -sf http://127.0.0.1:3111/health | grep -q '"success":true') && (curl -sf http://127.0.0.1:3113/health | grep -q '"success":true')
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

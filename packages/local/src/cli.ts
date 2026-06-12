@@ -1463,9 +1463,80 @@ function json(c: any, payload: Record<string, unknown>, status = 200) {
   return c.json({ success: status < 400, ...payload, trace_id: randomUUID() }, status);
 }
 
+function requestLogger() {
+  return async (c: any, next: any) => {
+    const ignoredPaths = new Set([
+      '/',
+    ]);
+
+    if (ignoredPaths.has(c.req.path) || c.req.path.endsWith('/health')) {
+      await next();
+      return;
+    }
+
+    const start = Date.now();
+    const statusCode = c.res.status;
+    const reqId = c.get('trace_id') || randomUUID();
+    const method = c.req.method;
+    const path = c.req.path;
+    const route = c.req.routePath;
+    const rawUrl = c.req.raw.url;
+    const query = rawUrl.includes('?')
+      ? rawUrl.split('?')[1]
+      : '';
+    const queryParams = Object.fromEntries(
+      new URL(rawUrl).searchParams.entries()
+    );
+    const headers = {
+      host: c.req.header('host'),
+      origin: c.req.header('origin'),
+      referer: c.req.header('referer'),
+      'x-forwarded-for': c.req.header('x-forwarded-for'),
+      'x-real-ip': c.req.header('x-real-ip'),
+      'x-forwarded-proto': c.req.header('x-forwarded-proto'),
+      'x-forwarded-host': c.req.header('x-forwarded-host'),
+      'x-forwarded-port': c.req.header('x-forwarded-port'),
+      'user-agent': c.req.header('user-agent'),
+      'content-type': c.req.header('content-type'),
+      'content-length': c.req.header('content-length'),
+      accept: c.req.header('accept'),
+      'accept-language': c.req.header('accept-language'),
+      'accept-encoding': c.req.header('accept-encoding'),
+      'cache-control': c.req.header('cache-control'),
+      'if-none-match': c.req.header('if-none-match'),
+      'if-modified-since': c.req.header('if-modified-since'),
+      'x-request-id': c.req.header('x-request-id'),
+      'x-correlation-id': c.req.header('x-correlation-id'),
+    };
+
+    await next();
+
+    const log = {
+      timestamp: new Date().toISOString(),
+      durationMs: Date.now() - start,
+      statusCode,
+      request: {
+        id: reqId,
+        method,
+        path,
+        route,
+        url: rawUrl,
+        query,
+        queryParams,
+        headers
+      },
+    };
+
+    console.log(JSON.stringify(log));
+  };
+}
+
 function createApp(runtime: LocalMemoryRuntime) {
   ensureConnectorsRegistered();
   const app = new Hono();
+
+  app.use('*', requestLogger());
+
   const sources = new SourceStore(RETAINDB_HOME);
   app.get("/", (c) => json(c, {
     name: "RetainDB Local",
@@ -2044,7 +2115,10 @@ function viewerHtml(apiPort: number) {
 
 function createViewerApp(apiPort: number) {
   const app = new Hono();
+  app.use('*', requestLogger());
   app.get("/", (c) => c.html(viewerHtml(apiPort)));
+  app.get("/health", (c) => json(c, { status: "ok", local: true }));
+  app.get("/viewer/health", (c) => json(c, { status: "ok", local: true }));
   return app;
 }
 
