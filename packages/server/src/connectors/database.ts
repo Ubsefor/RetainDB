@@ -1,4 +1,4 @@
-import postgres from "postgres";
+import { Pool } from "pg";
 import { ingestDocument } from "../engine/ingest.js";
 
 interface DatabaseConfig {
@@ -17,31 +17,32 @@ export async function syncDatabase(
   const { connectionString, includeSchema = true, includeSampleData = false, tables } = config;
   
   if (!connectionString) {
-    throw new Error("Database requires 'connectionString' in config. Format: postgres://user:pass@host:5432/db");
+    throw new Error("Database requires 'connectionString' in config. Format: postgres://user:***@host:5432/db");
   }
 
   let indexed = 0;
   let targetTables: any[] = [];
 
-  const sql = postgres(connectionString, { max: 1, connect_timeout: 10 });
+  const pool = new Pool({ connectionString, max: 1, connectionTimeoutMillis: 10000 });
 
   try {
     // Get all tables
-    const allTables = await sql`
+    const allTablesResult = await pool.query(`
       SELECT table_schema, table_name
       FROM information_schema.tables
       WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
       AND table_type = 'BASE TABLE'
       ORDER BY table_schema, table_name
-    `;
+    `);
+    const allTables = allTablesResult.rows;
 
     targetTables = tables?.length
-      ? allTables.filter((t) => tables.includes(t.table_name) || tables.includes(`${t.table_schema}.${t.table_name}`))
+      ? allTables.filter((t: any) => tables.includes(t.table_name) || tables.includes(`${t.table_schema}.${t.table_name}`))
       : allTables;
 
     // Index overall schema overview
     const overview = targetTables
-      .map((t) => `- ${t.table_schema}.${t.table_name}`)
+      .map((t: any) => `- ${t.table_schema}.${t.table_name}`)
       .join("\n");
 
     await ingestDocument({
@@ -57,7 +58,7 @@ export async function syncDatabase(
     // Index each table's schema
     if (includeSchema) {
       for (const table of targetTables) {
-        const columns = await sql`
+        const columnsResult = await pool.query(`
           SELECT
             column_name,
             data_type,
@@ -65,13 +66,14 @@ export async function syncDatabase(
             column_default,
             character_maximum_length
           FROM information_schema.columns
-          WHERE table_schema = ${table.table_schema}
-          AND table_name = ${table.table_name}
+          WHERE table_schema = $1
+          AND table_name = $2
           ORDER BY ordinal_position
-        `;
+        `, [table.table_schema, table.table_name]);
+        const columns = columnsResult.rows;
 
         // Get constraints
-        const constraints = await sql`
+        const constraintsResult = await pool.query(`
           SELECT
             tc.constraint_type,
             tc.constraint_name,
@@ -84,38 +86,40 @@ export async function syncDatabase(
           LEFT JOIN information_schema.constraint_column_usage ccu
             ON tc.constraint_name = ccu.constraint_name
             AND tc.constraint_type = 'FOREIGN KEY'
-          WHERE tc.table_schema = ${table.table_schema}
-          AND tc.table_name = ${table.table_name}
-        `;
+          WHERE tc.table_schema = $1
+          AND tc.table_name = $2
+        `, [table.table_schema, table.table_name]);
+        const constraints = constraintsResult.rows;
 
         // Get indexes
-        const indexes = await sql`
+        const indexesResult = await pool.query(`
           SELECT indexname, indexdef
           FROM pg_indexes
-          WHERE schemaname = ${table.table_schema}
-          AND tablename = ${table.table_name}
-        `;
+          WHERE schemaname = $1
+          AND tablename = $2
+        `, [table.table_schema, table.table_name]);
+        const indexes = indexesResult.rows;
 
         const fullName = `${table.table_schema}.${table.table_name}`;
 
         const content = [
           `# Table: ${fullName}`,
           "\n## Columns\n",
-          ...columns.map((c) => {
+          ...columns.map((c: any) => {
             const nullable = c.is_nullable === "YES" ? "nullable" : "not null";
             const def = c.column_default ? `, default: ${c.column_default}` : "";
             const len = c.character_maximum_length ? `(${c.character_maximum_length})` : "";
             return `- \`${c.column_name}\` ${c.data_type}${len} (${nullable}${def})`;
           }),
           constraints.length ? "\n## Constraints\n" : "",
-          ...constraints.map((c) => {
+          ...constraints.map((c: any) => {
             if (c.constraint_type === "FOREIGN KEY") {
               return `- FK \`${c.column_name}\` → ${c.foreign_table}.${c.foreign_column}`;
             }
             return `- ${c.constraint_type}: \`${c.column_name}\``;
           }),
           indexes.length ? "\n## Indexes\n" : "",
-          ...indexes.map((i) => `- ${i.indexname}: ${i.indexdef}`),
+          ...indexes.map((i: any) => `- ${i.indexname}: ${i.indexdef}`),
         ].filter(Boolean).join("\n");
 
         await ingestDocument({
@@ -141,7 +145,8 @@ export async function syncDatabase(
       for (const table of targetTables) {
         try {
           const fullName = `${table.table_schema}.${table.table_name}`;
-          const rows = await sql.unsafe(`SELECT * FROM "${table.table_schema}"."${table.table_name}" LIMIT 5`);
+          const rowsResult = await pool.query(`SELECT * FROM "${table.table_schema}"."${table.table_name}" LIMIT 5`);
+          const rows = rowsResult.rows;
 
           if (rows.length === 0) continue;
 
@@ -168,7 +173,7 @@ export async function syncDatabase(
       }
     }
   } finally {
-    await sql.end();
+    await pool.end();
   }
 
   return { documentsIndexed: indexed, tablesProcessed: targetTables.length };

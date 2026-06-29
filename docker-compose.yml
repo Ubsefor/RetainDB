@@ -29,6 +29,7 @@ services:
       DATABASE_URL: "postgresql://retaindb:retaindb@postgres:5432/retaindb"
       RETAINDB_API_KEY: "${RETAINDB_API_KEY:-changeme}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:-changemyencryptionkey}"
       EXTRACTION_MODEL: "${EXTRACTION_MODEL:-gpt-4o-mini}"
       PORT: "3000"
     depends_on:

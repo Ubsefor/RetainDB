@@ -1,4 +1,6 @@
 import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { Pool } from "pg";
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;
@@ -27,20 +29,28 @@ function buildDatabaseUrl(): string | undefined {
   }
 }
 
+const databaseUrl = buildDatabaseUrl();
+
+let adapter: any = undefined;
+if (databaseUrl) {
+  const pool = new Pool({ connectionString: databaseUrl });
+  adapter = new PrismaPg(pool);
+}
+
 export const db = globalForPrisma.prisma ?? new PrismaClient({
-  datasources: {
-    db: {
-      url: buildDatabaseUrl(),
-    },
-  },
+  ...(adapter ? { adapter } : {}),
 });
 export const prisma = db;
 
 // Single middleware — converts BigInt to string at the DB boundary.
 // Arrays are already covered by the object branch since Array is also typeof "object".
-prisma.$use(async (params, next) => {
-  const result = await next(params);
-  return hasBigInt(result) ? convertBigIntToString(result) : result;
+prisma.$extends({
+  query: {
+    $allOperations: async ({ args, query }) => {
+      const result = await query(args);
+      return hasBigInt(result) ? convertBigIntToString(result) : result;
+    },
+  },
 });
 
 // Fast check before doing full recursive traversal
